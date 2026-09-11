@@ -4,7 +4,7 @@ set -eu
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repo_dir=$(CDPATH= cd -- "$script_dir/../.." && pwd)
 sfizioso_dir="$repo_dir/deps/sfizioso"
-expected_commit=0c8dec55906e57f5bdd2abb95496a652a8264f83
+expected_commit=3fbba4cc3218efa99dc265945244d6b16b0e1df2
 
 git -C "$repo_dir" submodule update --init --recursive deps/sfizioso
 

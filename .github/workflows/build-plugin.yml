@@ -34,7 +34,12 @@ jobs:
           submodules: recursive
 
       - name: Prepare sfizioso
-        run: tools/sfz/bootstrap.sh
+        run: |
+          # The toolchain container runs as root while checkout files retain
+          # the host runner's ownership. This workspace is an ephemeral,
+          # trusted Actions checkout, including recursive submodules.
+          git config --global --add safe.directory '*'
+          tools/sfz/bootstrap.sh
 
       - name: Get Rack SDK
         run: |
