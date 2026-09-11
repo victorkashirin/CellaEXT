@@ -6,9 +6,15 @@ export of the ChatGPT conversation that led to it.
 - [V1 implementation plan](v1-plan.md) — a narrow vertical slice proving the
   four prototype gates: large-SFZ loading, stereo rendering, 16 Rack note
   lanes, and independent continuous pitch on every lane.
-- [Full product roadmap](full-roadmap.md) — the staged path from the V1 slice
-  to a Rack-native sampler intended to exceed the existing Squinky Labs SFZ
-  Player in compatibility, stereo fidelity, workflow, and modulation.
+- [V1 implementation results](v1-results.md) — the as-built verification
+  record, supported-target package results, and proceed decision.
+- [Focused expression prototype roadmap](next-step-roadmap.md) — the active
+  next step: a usable expression and keyswitch expander built around V1's
+  independent note lanes.
+- [Roadmap decisions](roadmap-decisions.md) — the selected primary and
+  secondary features, their rationale, and explicit deferrals.
+- [Full product roadmap](full-roadmap.md) — the aspirational long-term idea
+  catalogue. It is no longer the active implementation sequence.
 - [Competitive source audit](competitive-analysis.md) — a code-backed baseline
   of what the pulled Squinky player actually does, what V1 deliberately does
   not match, and which later milestones constitute a credible win.
