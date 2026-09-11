@@ -1,0 +1,21 @@
+{
+  "slug": "Cella-EXT",
+  "name": "Cella EXT",
+  "version": "2.0.0",
+  "license": "GPL-3.0-or-later",
+  "brand": "Cella",
+  "author": "Victor Kashirin",
+  "authorUrl": "https://victorkashirin.com/",
+  "modules": [
+    {
+      "slug": "SFZ",
+      "name": "SFZ",
+      "description": "Polyphonic SFZ sampler with true stereo output",
+      "keywords": "sfz sampler instrument polyphonic stereo",
+      "tags": [
+        "Sampler",
+        "Polyphonic"
+      ]
+    }
+  ]
+}
