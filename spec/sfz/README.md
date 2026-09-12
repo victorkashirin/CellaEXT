@@ -36,14 +36,18 @@ export of the ChatGPT conversation that led to it.
   `deps/ebur128/`. Record its commit, recursive dependency pins, enabled build
   options, licenses, and any Cella patches in `deps/README.md`; do not depend
   on a system installation or an unpinned checkout.
-- V1 polyphony means up to 16 polyphonic V/OCT/GATE/VELOCITY input channels,
-  each with continuously tracked independent V/OCT pitch, mixed by one sampler
-  into one stereo pair. `LEFT` and `RIGHT` are monophonic Rack outputs; they
-  are the two channels of the stereo mix.
-- Squinky's comparison player uses a different output contract: each input
-  lane produces one mono channel on a polyphonic output cable. Cella V1 tests
-  stereo instrument polyphony, not yet lane-preserving audio parity. The full
-  roadmap treats a stereo lane-preserving mode as an early architecture gate.
+- Cella accepts up to 16 polyphonic V/OCT/GATE/VELOCITY input channels, each
+  with continuously tracked independent V/OCT pitch. `LEFT` and `RIGHT`
+  produce the shared stereo mix by default. The panel `POLY` switch instead
+  makes both jacks polyphonic: output channel `n` is the stereo signal from
+  Rack note lane `n`, and the output channel count follows V/OCT.
+- Polyphonic output retains voice-local SFZ processing, including envelopes,
+  filters, panning, pitch, pressure, timbre, and source-specific CCs. It taps
+  each voice before sfizioso's instrument-wide `<effect>` buses, so those
+  shared effects are bypassed in `POLY` mode. Mixed stereo retains them.
+- Squinky's comparison player produces one mono channel per input lane. Cella's
+  `POLY` mode preserves a distinct left and right signal for every lane while
+  retaining the original mixed-stereo mode and the left-only fold-down.
 - Sfizioso's stock non-MPE mode preserves all 16 source channels for note
   ownership but collapses expression to channel 0. V1 must therefore implement
   and test a small `Rack-16` expression profile in the engine; standards-

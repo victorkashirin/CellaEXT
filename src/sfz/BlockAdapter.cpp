@@ -27,6 +27,45 @@ bool BlockAdapter::render(float* left, float* right, int frames) noexcept
         return false;
     }
 
+    if (!enqueueEvents(frames))
+        return false;
+    engine_->render(left, right, frames);
+    clear();
+    return true;
+}
+
+bool BlockAdapter::renderPolyphonic(float* const* left, float* const* right,
+    int channels, int frames) noexcept
+{
+    if (!left || !right || channels < 1 || channels > MaxAudioOutputLanes
+        || frames <= 0 || frames > MaxFrames) {
+        droppedEventCount_ += eventCount_;
+        clear();
+        return false;
+    }
+    for (int channel = 0; channel < channels; ++channel) {
+        if (!left[channel] || !right[channel]) {
+            droppedEventCount_ += eventCount_;
+            clear();
+            return false;
+        }
+    }
+
+    if (!enqueueEvents(frames))
+        return false;
+    engine_->renderPolyphonic(left, right, channels, frames);
+    clear();
+    return true;
+}
+
+bool BlockAdapter::enqueueEvents(int frames) noexcept
+{
+    if (frames <= 0 || frames > MaxFrames) {
+        droppedEventCount_ += eventCount_;
+        clear();
+        return false;
+    }
+
     std::sort(events_.begin(), events_.begin() + eventCount_,
         [](const QueuedEvent& a, const QueuedEvent& b) {
             if (a.event.frameOffset != b.event.frameOffset)
@@ -42,8 +81,6 @@ bool BlockAdapter::render(float* left, float* right, int frames) noexcept
         }
         engine_->enqueue(event);
     }
-    engine_->render(left, right, frames);
-    clear();
     return true;
 }
 

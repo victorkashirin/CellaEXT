@@ -22,6 +22,18 @@ Run the transferred V1 verification suite with:
 make sfz-test
 ```
 
+## Polyphonic stereo output
+
+`LEFT` and `RIGHT` produce the instrument's mixed stereo output by default.
+Enable the panel `POLY` button to make both jacks polyphonic: channel `n` on
+each jack contains only V/OCT lane `n`, preserving that lane's left and right
+sample audio. The channel count follows the V/OCT input. If only `LEFT` is
+connected, each lane receives its own `(L + R) / 2` fold-down.
+
+Polyphonic mode keeps voice-local envelopes, filters, panning, pitch, pressure,
+timbre, and CC modulation. It bypasses instrument-wide SFZ `<effect>` buses;
+disable `POLY` to hear the normal shared-effect stereo mix.
+
 ## SFZ Expression expander
 
 Place **SFZ Expression** directly to the right of **Cella SFZ**. Its `BEND`

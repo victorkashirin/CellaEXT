@@ -7,6 +7,8 @@
 
 namespace cella::sfz {
 
+constexpr int MaxAudioOutputLanes = 16;
+
 enum class EngineEventType : uint8_t {
     NoteOn,
     NoteOff,
@@ -97,6 +99,8 @@ public:
     virtual void setTuningFrequency(float frequency) = 0;
     virtual void enqueue(const TimedEngineEvent& event) noexcept = 0;
     virtual void render(float* left, float* right, int frames) noexcept = 0;
+    virtual void renderPolyphonic(float* const* left, float* const* right,
+        int channels, int frames) noexcept = 0;
     virtual EngineStats stats() const noexcept = 0;
     // Runtime telemetry is sampled by Cella immediately after render(). Test
     // doubles can leave the default zero values and never depend on sfizioso.

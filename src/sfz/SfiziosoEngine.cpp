@@ -315,6 +315,23 @@ void SfiziosoEngine::render(float* left, float* right, int frames) noexcept
     impl_->synth.renderBlock(outputs, static_cast<size_t>(frames));
 }
 
+void SfiziosoEngine::renderPolyphonic(float* const* left, float* const* right,
+    int channels, int frames) noexcept
+{
+    if (!left || !right || channels < 1 || channels > MaxAudioOutputLanes
+        || frames <= 0)
+        return;
+    std::array<float*, 2 * MaxAudioOutputLanes> outputs {};
+    for (int channel = 0; channel < channels; ++channel) {
+        if (!left[channel] || !right[channel])
+            return;
+        outputs[2 * channel] = left[channel];
+        outputs[2 * channel + 1] = right[channel];
+    }
+    impl_->synth.renderBlockBySourceChannel(outputs.data(),
+        static_cast<size_t>(frames), channels);
+}
+
 EngineStats SfiziosoEngine::stats() const noexcept
 {
     return impl_->stats;

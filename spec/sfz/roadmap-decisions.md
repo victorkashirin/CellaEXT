@@ -78,7 +78,6 @@ architecture.
 Deferral means “not in this prototype,” not “never.” The full roadmap remains
 the reference for these ideas, without implying their implementation order.
 
-- stereo lane-preserving outputs;
 - large-library disk streaming and shared sample caches;
 - broad compatibility diagnostics and missing-sample recovery;
 - extended CC assignment;
@@ -88,3 +87,7 @@ the reference for these ideas, without implying their implementation order.
 - multiple output buses and output expanders;
 - browser, indexing, authoring, conversion, and advanced tuning tools;
 - public API freezing, cross-platform packaging, and stable-release polish.
+
+Stereo lane-preserving output was subsequently implemented on the base module
+as a `POLY` switch. It preserves per-lane voice DSP and expression, bypassing
+instrument-wide SFZ effect buses only while the polyphonic output is selected.

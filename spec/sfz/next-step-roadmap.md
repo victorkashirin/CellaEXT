@@ -123,9 +123,13 @@ are not exit gates.
 
 ## Deferred, without ordering
 
-- stereo lane-preserving outputs;
 - large-library streaming and shared sample caches;
 - broad compatibility diagnostics and missing-sample recovery;
 - extended CC assignment and per-slot transforms;
 - direct or momentary keyswitch modes, sustain, sostenuto, and release velocity;
 - multiple output buses, browsing, authoring, conversion, and advanced tuning.
+
+Stereo lane-preserving output was implemented after this expression prototype:
+the base module's `POLY` switch changes its existing left/right jacks between
+mixed stereo and one stereo pair per Rack note lane. Shared SFZ effect buses are
+bypassed in that mode while source-specific expression remains voice-local.

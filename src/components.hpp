@@ -22,3 +22,14 @@ struct VCVButtonHuge : app::SvgSwitch {
             pluginInstance, "res/components/VCVButtonHuge_1.svg")));
     }
 };
+
+struct VCVButtonHugeToggle : app::SvgSwitch {
+    VCVButtonHugeToggle()
+    {
+        momentary = false;
+        addFrame(Svg::load(asset::plugin(
+            pluginInstance, "res/components/VCVButtonHuge_0.svg")));
+        addFrame(Svg::load(asset::plugin(
+            pluginInstance, "res/components/VCVButtonHuge_1.svg")));
+    }
+};

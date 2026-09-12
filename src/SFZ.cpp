@@ -435,6 +435,7 @@ struct CellaSFZ : Module {
         LOAD_PARAM,
         PREVIOUS_PARAM,
         NEXT_PARAM,
+        POLY_OUTPUT_PARAM,
         PARAMS_LEN
     };
     enum InputId {
@@ -454,13 +455,16 @@ struct CellaSFZ : Module {
 
     static_assert(LEVEL_PARAM == 0 && OCTAVE_PARAM == 1 && TUNE_PARAM == 2
             && LOAD_PARAM == 3 && PREVIOUS_PARAM == 4 && NEXT_PARAM == 5
-            && PARAMS_LEN == 6,
+            && POLY_OUTPUT_PARAM == 6 && PARAMS_LEN == 7,
         "Cella SFZ parameter IDs are part of the patch format");
     static_assert(VOCT_INPUT == 0 && GATE_INPUT == 1 && VELOCITY_INPUT == 2
             && INPUTS_LEN == 3,
         "Cella SFZ input IDs are part of the patch format");
     static_assert(LEFT_OUTPUT == 0 && RIGHT_OUTPUT == 1 && OUTPUTS_LEN == 2,
         "Cella SFZ output IDs are part of the patch format");
+    static_assert(static_cast<size_t>(cella::sfz::MaxAudioOutputLanes)
+            == cella::sfz::MaxNoteLanes,
+        "every Rack note lane needs one stereo output lane");
 
     enum class StatusState : uint8_t {
         Unloaded,
@@ -624,8 +628,12 @@ struct CellaSFZ : Module {
     int captureFrame_ { 0 };
     int activeRenderQuantum_ { kDefaultRenderQuantum };
     int playbackFrame_ { kDefaultRenderQuantum };
-    std::array<float, kMaximumRenderQuantum> playbackLeft_ {};
-    std::array<float, kMaximumRenderQuantum> playbackRight_ {};
+    using PlaybackBuffer = std::array<std::array<float, kMaximumRenderQuantum>,
+        cella::sfz::MaxAudioOutputLanes>;
+    PlaybackBuffer playbackLeft_ {};
+    PlaybackBuffer playbackRight_ {};
+    bool playbackPolyphonic_ { false };
+    int playbackChannels_ { 1 };
     std::array<float, cella::sfz::MaxNoteLanes> pitchVoltages_ {};
     std::array<float, cella::sfz::MaxNoteLanes> gateVoltages_ {};
     std::array<float, cella::sfz::MaxNoteLanes> velocityVoltages_ {};
@@ -668,6 +676,8 @@ struct CellaSFZ : Module {
         configButton(LOAD_PARAM, "Load SFZ");
         configButton(PREVIOUS_PARAM, "Previous SFZ in folder");
         configButton(NEXT_PARAM, "Next SFZ in folder");
+        configSwitch(POLY_OUTPUT_PARAM, 0.0f, 1.0f, 0.0f, "Output mode",
+            { "Mixed stereo", "Polyphonic stereo" });
 
         configInput(VOCT_INPUT, "1 V/octave pitch");
         configInput(GATE_INPUT, "Gate");
@@ -729,6 +739,26 @@ struct CellaSFZ : Module {
     {
         const int frames = renderQuantumSetting_.load(std::memory_order_acquire);
         return isRenderQuantum(frames) ? frames : kDefaultRenderQuantum;
+    }
+
+    bool polyphonicOutputEnabled() noexcept
+    {
+        return params[POLY_OUTPUT_PARAM].getValue() >= 0.5f;
+    }
+
+    void clearPlaybackBuffers() noexcept
+    {
+        for (auto& lane : playbackLeft_)
+            lane.fill(0.0f);
+        for (auto& lane : playbackRight_)
+            lane.fill(0.0f);
+    }
+
+    void resetPlayback() noexcept
+    {
+        clearPlaybackBuffers();
+        playbackPolyphonic_ = false;
+        playbackChannels_ = 1;
     }
 
     TailBehavior tailBehavior() const noexcept
@@ -1505,8 +1535,7 @@ struct CellaSFZ : Module {
         outputLimitingWarningUntilNanoseconds_.store(0,
             std::memory_order_release);
         captureEventCount_ = 0;
-        playbackLeft_.fill(0.0f);
-        playbackRight_.fill(0.0f);
+        resetPlayback();
         activeRenderQuantum_ = renderQuantum();
         playbackFrame_ = activeRenderQuantum_;
         // Publish activation only after every runtime value has been reset for
@@ -1549,8 +1578,7 @@ struct CellaSFZ : Module {
         publishedAdapterDrops_ = 0;
         publishedAdapterEngine_ = nullptr;
         captureEventCount_ = 0;
-        playbackLeft_.fill(0.0f);
-        playbackRight_.fill(0.0f);
+        resetPlayback();
         playbackFrame_ = activeRenderQuantum_;
         fadeInAfterRender_ = false;
         sampleRateTransitionActive_ = false;
@@ -1667,8 +1695,7 @@ struct CellaSFZ : Module {
             && !pendingReady) {
             activeRenderQuantum_ = renderQuantum();
             captureEventCount_ = 0;
-            playbackLeft_.fill(0.0f);
-            playbackRight_.fill(0.0f);
+            resetPlayback();
             playbackFrame_ = activeRenderQuantum_;
             quantumTransitionActive_ = false;
             fadeInAfterRender_ = true;
@@ -1724,8 +1751,12 @@ struct CellaSFZ : Module {
 
     void finishCaptureBlock() noexcept
     {
-        playbackLeft_.fill(0.0f);
-        playbackRight_.fill(0.0f);
+        clearPlaybackBuffers();
+        playbackPolyphonic_ = polyphonicOutputEnabled();
+        playbackChannels_ = playbackPolyphonic_
+            ? std::clamp(inputs[VOCT_INPUT].getChannels(), 1,
+                  static_cast<int>(cella::sfz::MaxAudioOutputLanes))
+            : 1;
         if (activeEngine_) {
             const TailBehavior behavior = tailBehavior();
             for (size_t index = 0; index < captureEventCount_; ++index) {
@@ -1745,8 +1776,19 @@ struct CellaSFZ : Module {
                 }
                 activeEngine_->adapter.push(event);
             }
-            activeEngine_->adapter.render(playbackLeft_.data(), playbackRight_.data(),
-                activeRenderQuantum_);
+            if (playbackPolyphonic_) {
+                std::array<float*, cella::sfz::MaxAudioOutputLanes> left {};
+                std::array<float*, cella::sfz::MaxAudioOutputLanes> right {};
+                for (size_t lane = 0; lane < left.size(); ++lane) {
+                    left[lane] = playbackLeft_[lane].data();
+                    right[lane] = playbackRight_[lane].data();
+                }
+                activeEngine_->adapter.renderPolyphonic(left.data(), right.data(),
+                    static_cast<int>(left.size()), activeRenderQuantum_);
+            } else {
+                activeEngine_->adapter.render(playbackLeft_[0].data(),
+                    playbackRight_[0].data(), activeRenderQuantum_);
+            }
             const int activeVoices =
                 std::max(0, activeEngine_->engine->activeVoiceCount());
             activeVoiceCount_.store(activeVoices, std::memory_order_release);
@@ -1815,13 +1857,22 @@ struct CellaSFZ : Module {
         audioTimeNanoseconds_.fetch_add(
             nanosecondsPerSample, std::memory_order_release);
 
-        float left = 0.0f;
-        float right = 0.0f;
-        if (playbackFrame_ < activeRenderQuantum_) {
-            left = playbackLeft_[playbackFrame_];
-            right = playbackRight_[playbackFrame_];
-            ++playbackFrame_;
+        const bool playbackAvailable = playbackFrame_ < activeRenderQuantum_;
+        const int playbackIndex = playbackFrame_;
+        const bool outputPolyphonic = playbackPolyphonic_;
+        const int outputChannels = outputPolyphonic ? playbackChannels_ : 1;
+        std::array<float, cella::sfz::MaxAudioOutputLanes> leftSamples;
+        std::array<float, cella::sfz::MaxAudioOutputLanes> rightSamples;
+        for (int channel = 0; channel < outputChannels; ++channel) {
+            leftSamples[channel] = playbackAvailable
+                ? playbackLeft_[channel][playbackIndex]
+                : 0.0f;
+            rightSamples[channel] = playbackAvailable
+                ? playbackRight_[channel][playbackIndex]
+                : 0.0f;
         }
+        if (playbackAvailable)
+            ++playbackFrame_;
 
         if (captureFrame_ == 0)
             beginCaptureBlock();
@@ -1835,25 +1886,32 @@ struct CellaSFZ : Module {
 
         const float gain = params[LEVEL_PARAM].getValue() * kNominalOutputVolts;
         const float lifecycleGain = advanceLifecycleFade(args.sampleRate);
-        const float scaledLeft = left * gain * lifecycleGain;
-        const float scaledRight = right * gain * lifecycleGain;
-        if (std::abs(scaledLeft) > kLimiterKneeVolts
-            || std::abs(scaledRight) > kLimiterKneeVolts) {
+        outputs[LEFT_OUTPUT].setChannels(outputChannels);
+        outputs[RIGHT_OUTPUT].setChannels(outputChannels);
+        const bool rightConnected = outputs[RIGHT_OUTPUT].isConnected();
+        bool limiting = false;
+        for (int channel = 0; channel < outputChannels; ++channel) {
+            const float left = leftSamples[channel];
+            const float right = rightSamples[channel];
+            const float scaledLeft = left * gain * lifecycleGain;
+            const float scaledRight = right * gain * lifecycleGain;
+            limiting = limiting || std::abs(scaledLeft) > kLimiterKneeVolts
+                || std::abs(scaledRight) > kLimiterKneeVolts;
+            const float limitedLeft = softLimit(scaledLeft);
+            const float limitedRight = softLimit(scaledRight);
+            outputs[LEFT_OUTPUT].setVoltage(rightConnected
+                    ? limitedLeft
+                    : 0.5f * (limitedLeft + limitedRight),
+                channel);
+            outputs[RIGHT_OUTPUT].setVoltage(limitedRight, channel);
+        }
+        if (limiting) {
             outputLimitingCount_.fetch_add(1, std::memory_order_release);
             outputLimitingWarningUntilNanoseconds_.store(
                 audioTimeNanoseconds_.load(std::memory_order_relaxed)
                     + 1000000000ull,
                 std::memory_order_release);
         }
-        left = softLimit(scaledLeft);
-        right = softLimit(scaledRight);
-        outputs[LEFT_OUTPUT].setChannels(1);
-        outputs[RIGHT_OUTPUT].setChannels(1);
-        if (!outputs[RIGHT_OUTPUT].isConnected())
-            outputs[LEFT_OUTPUT].setVoltage(0.5f * (left + right));
-        else
-            outputs[LEFT_OUTPUT].setVoltage(left);
-        outputs[RIGHT_OUTPUT].setVoltage(right);
     }
 
     json_t* dataToJson() override
@@ -2506,6 +2564,8 @@ struct CellaSFZWidget : ModuleWidget {
             CellaSFZ::VELOCITY_INPUT));
         addOutput(createOutputCentered<ThemedPJ301MPort>(Vec(62, 330), module,
             CellaSFZ::LEFT_OUTPUT));
+        addParam(createParamCentered<VCVButtonHugeToggle>(Vec(90, 330), module,
+            CellaSFZ::POLY_OUTPUT_PARAM));
         addOutput(createOutputCentered<ThemedPJ301MPort>(Vec(118, 330), module,
             CellaSFZ::RIGHT_OUTPUT));
     }

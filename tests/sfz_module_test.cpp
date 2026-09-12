@@ -136,6 +136,14 @@ struct BlockingEngine final : cella::sfz::SamplerEngine {
         std::fill(left, left + frames, 0.0f);
         std::fill(right, right + frames, 0.0f);
     }
+    void renderPolyphonic(float* const* left, float* const* right, int channels,
+        int frames) noexcept override
+    {
+        for (int channel = 0; channel < channels; ++channel) {
+            std::fill(left[channel], left[channel] + frames, 0.0f);
+            std::fill(right[channel], right[channel] + frames, 0.0f);
+        }
+    }
     cella::sfz::EngineStats stats() const noexcept override { return {}; }
 
     std::shared_ptr<BlockingLoadState> state;
@@ -145,6 +153,8 @@ struct RecordingEngineState {
     std::mutex mutex;
     std::vector<int> maximumBlockSizes;
     std::vector<int> renderedBlockSizes;
+    std::vector<int> polyphonicBlockSizes;
+    std::vector<int> polyphonicChannelCounts;
     std::vector<cella::sfz::TimedEngineEvent> events;
     cella::sfz::InstrumentMetadata metadata;
     std::atomic<int> activeVoices { 0 };
@@ -187,6 +197,17 @@ struct RecordingEngine final : cella::sfz::SamplerEngine {
         std::fill(right, right + frames, 0.0f);
         std::lock_guard<std::mutex> lock(state->mutex);
         state->renderedBlockSizes.push_back(frames);
+    }
+    void renderPolyphonic(float* const* left, float* const* right, int channels,
+        int frames) noexcept override
+    {
+        for (int channel = 0; channel < channels; ++channel) {
+            std::fill(left[channel], left[channel] + frames, 0.0f);
+            std::fill(right[channel], right[channel] + frames, 0.0f);
+        }
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->polyphonicBlockSizes.push_back(frames);
+        state->polyphonicChannelCounts.push_back(channels);
     }
     cella::sfz::EngineStats stats() const noexcept override { return {}; }
     int activeVoiceCount() const noexcept override
@@ -250,6 +271,15 @@ struct RealtimeProbeEngine final : cella::sfz::SamplerEngine {
         std::fill(right, right + frames, 0.0f);
         state->renderCalls.fetch_add(1, std::memory_order_relaxed);
     }
+    void renderPolyphonic(float* const* left, float* const* right, int channels,
+        int frames) noexcept override
+    {
+        for (int channel = 0; channel < channels; ++channel) {
+            std::fill(left[channel], left[channel] + frames, 0.0f);
+            std::fill(right[channel], right[channel] + frames, 0.0f);
+        }
+        state->renderCalls.fetch_add(1, std::memory_order_relaxed);
+    }
     cella::sfz::EngineStats stats() const noexcept override { return {}; }
     const cella::sfz::InstrumentMetadata& instrumentMetadata() const noexcept override
     {
@@ -304,10 +334,11 @@ void waitForRetirement(CellaSFZ& module, uint64_t previousCount,
 
 void seedPlayback(CellaSFZ& module, float left, float right)
 {
-    module.playbackLeft_.fill(0.0f);
-    module.playbackRight_.fill(0.0f);
-    module.playbackLeft_[0] = left;
-    module.playbackRight_[0] = right;
+    module.clearPlaybackBuffers();
+    module.playbackLeft_[0][0] = left;
+    module.playbackRight_[0][0] = right;
+    module.playbackPolyphonic_ = false;
+    module.playbackChannels_ = 1;
     module.playbackFrame_ = 0;
 }
 
@@ -337,6 +368,7 @@ void testPermanentIdsAndDefaults()
     static_assert(CellaSFZ::LOAD_PARAM == 3);
     static_assert(CellaSFZ::PREVIOUS_PARAM == 4);
     static_assert(CellaSFZ::NEXT_PARAM == 5);
+    static_assert(CellaSFZ::POLY_OUTPUT_PARAM == 6);
     static_assert(CellaSFZ::VOCT_INPUT == 0);
     static_assert(CellaSFZ::GATE_INPUT == 1);
     static_assert(CellaSFZ::VELOCITY_INPUT == 2);
@@ -354,6 +386,8 @@ void testPermanentIdsAndDefaults()
         1.0e-6f, "PREVIOUS default");
     requireNear(module.params[CellaSFZ::NEXT_PARAM].getValue(), 0.0f,
         1.0e-6f, "NEXT default");
+    requireNear(module.params[CellaSFZ::POLY_OUTPUT_PARAM].getValue(), 0.0f,
+        1.0e-6f, "polyphonic output defaults to mixed stereo");
     require(module.renderQuantum() == 32, "render quantum defaults to 32 frames");
     require(module.tailBehavior() == CellaSFZ::TailBehavior::PreserveAll,
         "release tails are preserved by default");
@@ -1523,6 +1557,7 @@ void testRealtimeExpressionPath()
         const int enqueueCalls =
             state.enqueueCalls.load(std::memory_order_relaxed);
         const int renderCalls = state.renderCalls.load(std::memory_order_relaxed);
+        module.params[CellaSFZ::POLY_OUTPUT_PARAM].setValue(1.0f);
 
         // Holding the loader mutex turns an accidental process-side lock into
         // a deterministic deadlock. The fixed-size probe engine also records
@@ -1572,6 +1607,14 @@ void testRealtimeExpressionPath()
         "real realtime-probe SFZ loads");
     std::array<float, 64> left {};
     std::array<float, 64> right {};
+    std::array<std::array<float, 64>, cella::sfz::MaxAudioOutputLanes> polyLeft {};
+    std::array<std::array<float, 64>, cella::sfz::MaxAudioOutputLanes> polyRight {};
+    std::array<float*, cella::sfz::MaxAudioOutputLanes> polyLeftPointers {};
+    std::array<float*, cella::sfz::MaxAudioOutputLanes> polyRightPointers {};
+    for (int lane = 0; lane < cella::sfz::MaxAudioOutputLanes; ++lane) {
+        polyLeftPointers[lane] = polyLeft[lane].data();
+        polyRightPointers[lane] = polyRight[lane].data();
+    }
     engine.enqueue(cella::sfz::TimedEngineEvent::sourceCC(0, 0, 20, 0.25f));
     engine.enqueue(cella::sfz::TimedEngineEvent::noteOn(0, 0, 60, 1.0f));
     for (int block = 0; block < 4; ++block)
@@ -1597,7 +1640,12 @@ void testRealtimeExpressionPath()
         engine.enqueue(cella::sfz::TimedEngineEvent::timbre(0, 0, value));
         engine.enqueue(cella::sfz::TimedEngineEvent::sourceCC(
             0, 0, 20, value));
-        engine.render(left.data(), right.data(), 64);
+        if (block < 4) {
+            engine.render(left.data(), right.data(), 64);
+        } else {
+            engine.renderPolyphonic(polyLeftPointers.data(),
+                polyRightPointers.data(), cella::sfz::MaxAudioOutputLanes, 64);
+        }
     }
     trackRealtimeAllocations = false;
     require(realtimeAllocations == 0,
@@ -1638,6 +1686,98 @@ void testOutputCalibrationAndRouting()
     mono.process(processArgs());
     requireNear(mono.outputs[CellaSFZ::LEFT_OUTPUT].getVoltage(), 3.0f, 1.0e-6f,
         "left-only output must use (L + R) * 0.5");
+
+    CellaSFZ polyphonic;
+    polyphonic.outputs[CellaSFZ::LEFT_OUTPUT].channels = 1;
+    polyphonic.outputs[CellaSFZ::RIGHT_OUTPUT].channels = 1;
+    polyphonic.clearPlaybackBuffers();
+    polyphonic.playbackPolyphonic_ = true;
+    polyphonic.playbackChannels_ = 3;
+    polyphonic.playbackLeft_[0][0] = 0.25f;
+    polyphonic.playbackRight_[0][0] = -0.25f;
+    polyphonic.playbackLeft_[1][0] = 0.5f;
+    polyphonic.playbackRight_[1][0] = -0.5f;
+    polyphonic.playbackLeft_[2][0] = 0.75f;
+    polyphonic.playbackRight_[2][0] = -0.75f;
+    polyphonic.playbackFrame_ = 0;
+    polyphonic.process(processArgs());
+    require(polyphonic.outputs[CellaSFZ::LEFT_OUTPUT].getChannels() == 3
+            && polyphonic.outputs[CellaSFZ::RIGHT_OUTPUT].getChannels() == 3,
+        "polyphonic mode publishes the captured V/OCT lane count on both jacks");
+    for (int channel = 0; channel < 3; ++channel) {
+        const float expected = 3.0f * static_cast<float>(channel + 1);
+        requireNear(polyphonic.outputs[CellaSFZ::LEFT_OUTPUT].getVoltage(channel),
+            expected, 1.0e-6f, "polyphonic left lane routing");
+        requireNear(polyphonic.outputs[CellaSFZ::RIGHT_OUTPUT].getVoltage(channel),
+            -expected, 1.0e-6f, "polyphonic right lane routing");
+    }
+
+    CellaSFZ polyphonicMono;
+    polyphonicMono.outputs[CellaSFZ::LEFT_OUTPUT].channels = 1;
+    polyphonicMono.outputs[CellaSFZ::RIGHT_OUTPUT].channels = 0;
+    polyphonicMono.clearPlaybackBuffers();
+    polyphonicMono.playbackPolyphonic_ = true;
+    polyphonicMono.playbackChannels_ = 2;
+    polyphonicMono.playbackLeft_[0][0] = 1.0f;
+    polyphonicMono.playbackRight_[0][0] = 0.0f;
+    polyphonicMono.playbackLeft_[1][0] = 0.0f;
+    polyphonicMono.playbackRight_[1][0] = 1.0f;
+    polyphonicMono.playbackFrame_ = 0;
+    polyphonicMono.process(processArgs());
+    requireNear(polyphonicMono.outputs[CellaSFZ::LEFT_OUTPUT].getVoltage(0), 6.0f,
+        1.0e-6f, "polyphonic left-only fold-down lane zero");
+    requireNear(polyphonicMono.outputs[CellaSFZ::LEFT_OUTPUT].getVoltage(1), 6.0f,
+        1.0e-6f, "polyphonic left-only fold-down lane one");
+}
+
+void testPolyphonicRenderSelection()
+{
+    const auto state = std::make_shared<RecordingEngineState>();
+    CellaSFZ module;
+    module.activeEngine_ = new CellaSFZ::EngineBundle(
+        std::make_unique<RecordingEngine>(state));
+    module.inputs[CellaSFZ::VOCT_INPUT].channels = 5;
+    module.params[CellaSFZ::POLY_OUTPUT_PARAM].setValue(1.0f);
+    module.finishCaptureBlock();
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        require(state->renderedBlockSizes.empty()
+                && state->polyphonicBlockSizes.size() == 1,
+            "polyphonic toggle selects the isolated render path at a block boundary");
+        require(state->polyphonicChannelCounts.back()
+                == cella::sfz::MaxAudioOutputLanes,
+            "sampler renders every source lane so tails keep advancing");
+    }
+    require(module.playbackPolyphonic_ && module.playbackChannels_ == 5,
+        "polyphonic playback exposes the current V/OCT channel count");
+
+    module.params[CellaSFZ::POLY_OUTPUT_PARAM].setValue(0.0f);
+    module.finishCaptureBlock();
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        require(state->renderedBlockSizes.size() == 1
+                && state->polyphonicBlockSizes.size() == 1,
+            "disabling the toggle restores the mixed stereo render path");
+    }
+    require(!module.playbackPolyphonic_ && module.playbackChannels_ == 1,
+        "mixed playback publishes one channel on each jack");
+
+    module.outputs[CellaSFZ::LEFT_OUTPUT].channels = 1;
+    module.outputs[CellaSFZ::RIGHT_OUTPUT].channels = 1;
+    seedPlayback(module, 0.25f, -0.25f);
+    module.captureFrame_ = module.activeRenderQuantum_ - 1;
+    module.params[CellaSFZ::POLY_OUTPUT_PARAM].setValue(1.0f);
+    module.process(processArgs());
+    require(module.outputs[CellaSFZ::LEFT_OUTPUT].getChannels() == 1,
+        "mode change does not reinterpret the final sample of the old block");
+    requireNear(module.outputs[CellaSFZ::LEFT_OUTPUT].getVoltage(), 3.0f,
+        1.0e-6f, "mode change preserves old-block left audio");
+    requireNear(module.outputs[CellaSFZ::RIGHT_OUTPUT].getVoltage(), -3.0f,
+        1.0e-6f, "mode change preserves old-block right audio");
+    module.process(processArgs());
+    require(module.outputs[CellaSFZ::LEFT_OUTPUT].getChannels() == 5
+            && module.outputs[CellaSFZ::RIGHT_OUTPUT].getChannels() == 5,
+        "polyphonic channel count begins with the newly rendered block");
 }
 
 void testJsonPersistence()
@@ -2269,6 +2409,8 @@ int main()
         std::puts("PASS: allocation-free lock-free realtime expression path");
         testOutputCalibrationAndRouting();
         std::puts("PASS: output calibration and routing");
+        testPolyphonicRenderSelection();
+        std::puts("PASS: polyphonic render selection and channel routing");
         testJsonPersistence();
         std::puts("PASS: JSON persistence");
         testExpressionExpanderStreamsAndRestoration();

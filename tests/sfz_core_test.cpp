@@ -158,6 +158,15 @@ public:
         for (int i = 0; i < frames; ++i)
             left[i] = right[i] = 0.0f;
     }
+    void renderPolyphonic(float* const* left, float* const* right, int channels,
+        int frames) noexcept override
+    {
+        ++renderCalls;
+        for (int channel = 0; channel < channels; ++channel) {
+            for (int i = 0; i < frames; ++i)
+                left[channel][i] = right[channel][i] = 0.0f;
+        }
+    }
     EngineStats stats() const noexcept override { return { true, 1, 1, 65536 }; }
 
     std::vector<TimedEngineEvent> events;
@@ -556,6 +565,48 @@ std::vector<std::array<float, 2>> renderBlocks(SamplerEngine& engine,
     return audio;
 }
 
+using PolyphonicFrame =
+    std::array<std::array<float, 2>, MaxAudioOutputLanes>;
+
+std::vector<PolyphonicFrame> renderPolyphonicBlocks(SamplerEngine& engine,
+    int frames, const std::vector<TimedEngineEvent>& initialEvents = {},
+    int quantum = 64)
+{
+    BlockAdapter adapter(engine);
+    std::vector<PolyphonicFrame> audio(static_cast<size_t>(frames));
+    int rendered = 0;
+    bool first = true;
+    while (rendered < frames) {
+        const int block = std::min(quantum, frames - rendered);
+        if (first) {
+            for (const TimedEngineEvent& event : initialEvents)
+                adapter.push(event);
+            first = false;
+        }
+        std::array<std::array<float, BlockAdapter::MaxFrames>,
+            MaxAudioOutputLanes> left {};
+        std::array<std::array<float, BlockAdapter::MaxFrames>,
+            MaxAudioOutputLanes> right {};
+        std::array<float*, MaxAudioOutputLanes> leftPointers {};
+        std::array<float*, MaxAudioOutputLanes> rightPointers {};
+        for (int source = 0; source < MaxAudioOutputLanes; ++source) {
+            leftPointers[source] = left[source].data();
+            rightPointers[source] = right[source].data();
+        }
+        adapter.renderPolyphonic(leftPointers.data(), rightPointers.data(),
+            MaxAudioOutputLanes, block);
+        for (int i = 0; i < block; ++i) {
+            for (int source = 0; source < MaxAudioOutputLanes; ++source) {
+                audio[static_cast<size_t>(rendered + i)][source] = {
+                    left[source][i], right[source][i]
+                };
+            }
+        }
+        rendered += block;
+    }
+    return audio;
+}
+
 double toneMagnitude(const std::vector<std::array<float, 2>>& audio,
     size_t offset, size_t frames, double frequency)
 {
@@ -598,6 +649,59 @@ void configure(SfiziosoEngine& engine)
 {
     engine.setSampleRate(SampleRate);
     engine.setMaximumBlockSize(64);
+}
+
+void testPolyphonicSourceOutput(const Fixtures& fixtures)
+{
+    const fs::path path = fixtures.directory / "polyphonic-output.sfz";
+    std::ofstream document(path);
+    document
+        << "<control> set_cc20=0\n"
+           "<region> sample=*sine ampeg_attack=0 volume=-48 "
+           "volume_oncc20=48 effect1=100\n"
+           "<effect> directtomain=0 fx1tomain=100 bus=fx1 type=lofi "
+           "bitred=90 decim=10\n";
+    document.close();
+
+    SfiziosoEngine engine;
+    configure(engine);
+    require(engine.load(path.string()).success,
+        "polyphonic source-output fixture loads");
+    BlockAdapter adapter(engine);
+    adapter.push(TimedEngineEvent::sourceCC(0, 2, 20, 1.0f));
+    adapter.push(TimedEngineEvent::sourceCC(0, 7, 20, 0.0f));
+    adapter.push(TimedEngineEvent::noteOn(1, 2, 60, 1.0f));
+    adapter.push(TimedEngineEvent::noteOn(1, 7, 60, 1.0f));
+
+    std::array<std::array<float, 64>, MaxAudioOutputLanes> left {};
+    std::array<std::array<float, 64>, MaxAudioOutputLanes> right {};
+    std::array<float*, MaxAudioOutputLanes> leftPointers {};
+    std::array<float*, MaxAudioOutputLanes> rightPointers {};
+    for (int source = 0; source < MaxAudioOutputLanes; ++source) {
+        leftPointers[source] = left[source].data();
+        rightPointers[source] = right[source].data();
+    }
+    require(adapter.renderPolyphonic(leftPointers.data(), rightPointers.data(),
+                MaxAudioOutputLanes, 64),
+        "polyphonic block adapter render succeeds");
+
+    const auto energy = [&left, &right](int source) {
+        double sum = 0.0;
+        for (int frame = 0; frame < 64; ++frame) {
+            sum += static_cast<double>(left[source][frame]) * left[source][frame];
+            sum += static_cast<double>(right[source][frame]) * right[source][frame];
+        }
+        return sum;
+    };
+    require(energy(2) > 1.0e-6,
+        "source output includes dry per-voice audio when shared effects are bypassed");
+    require(energy(2) > 100.0 * energy(7),
+        "source-specific CC modulation remains independent in polyphonic audio");
+    for (int source = 0; source < MaxAudioOutputLanes; ++source) {
+        if (source != 2 && source != 7)
+            require(energy(source) < 1.0e-12,
+                "silent source lanes receive no cross-channel audio");
+    }
 }
 
 void testExpressionReleaseOwnership(const Fixtures& fixtures)
@@ -838,6 +942,32 @@ void testGeneratedFixtures(const Fixtures& fixtures)
     require(stereoAudio[leftPeakIndex][0] > 0.0f
             && stereoAudio[rightPeakIndex][1] < 0.0f,
         "stereo impulse polarity is preserved");
+
+    SfiziosoEngine polyphonicStereo;
+    configure(polyphonicStereo);
+    require(polyphonicStereo.load(fixtures.stereoSfz.string()).success,
+        "polyphonic stereo fixture loads");
+    const auto polyphonicAudio = renderPolyphonicBlocks(polyphonicStereo, 1800,
+        { TimedEngineEvent::noteOn(0, 4, 60, 1.0f),
+            TimedEngineEvent::notePitch(0, 4, 60, 0.0f) });
+    float targetLeftPeak = 0.0f;
+    float targetRightPeak = 0.0f;
+    float otherPeak = 0.0f;
+    for (const auto& frame : polyphonicAudio) {
+        targetLeftPeak = std::max(targetLeftPeak, std::abs(frame[4][0]));
+        targetRightPeak = std::max(targetRightPeak, std::abs(frame[4][1]));
+        for (int source = 0; source < MaxAudioOutputLanes; ++source) {
+            if (source != 4) {
+                otherPeak = std::max(otherPeak,
+                    std::max(std::abs(frame[source][0]),
+                        std::abs(frame[source][1])));
+            }
+        }
+    }
+    require(targetLeftPeak > 0.01f && targetRightPeak > 0.01f,
+        "stereo sample reaches both outputs of its source lane");
+    require(otherPeak < 1.0e-6f,
+        "stereo source audio does not leak into another Rack lane");
 }
 
 void testEngineNoteIdentity(const Fixtures& fixtures)
@@ -1078,6 +1208,8 @@ int main()
         Fixtures fixtures;
         testGeneratedFixtures(fixtures);
         std::cout << "PASS: generated mono/stereo fixtures and stereo routing\n";
+        testPolyphonicSourceOutput(fixtures);
+        std::cout << "PASS: polyphonic source output and CC isolation\n";
         testInstrumentMetadata(fixtures);
         std::cout << "PASS: named controls and latched keyswitch metadata\n";
         testExpressionReleaseOwnership(fixtures);

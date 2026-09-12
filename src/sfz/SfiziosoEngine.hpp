@@ -22,6 +22,8 @@ public:
     void setTuningFrequency(float frequency) override;
     void enqueue(const TimedEngineEvent& event) noexcept override;
     void render(float* left, float* right, int frames) noexcept override;
+    void renderPolyphonic(float* const* left, float* const* right,
+        int channels, int frames) noexcept override;
     EngineStats stats() const noexcept override;
     int activeVoiceCount() const noexcept override;
     int voiceLimit() const noexcept override;

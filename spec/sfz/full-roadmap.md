@@ -77,10 +77,13 @@ Keep these concepts distinct in code, UI, tests, and documentation:
   samples, round robins, pedal behavior, and overlapping notes; user-settable
   with deterministic stealing.
 - **Audio-bus count:** one stereo main bus initially, then SFZ `output=` buses.
-- **Polyphonic audio output:** one stereo signal per Rack note lane. Squinky
-  already preserves lanes, although only as mono. Cella's lane-isolation design
-  must therefore be prototyped before the first release whose compatibility or
-  routing is presented as superior.
+- **Polyphonic audio output:** one stereo signal per Rack note lane. The
+  implemented `POLY` switch changes the existing `LEFT` and `RIGHT` jacks from
+  mixed stereo to matching Rack-polyphonic outputs; channel `n` contains only
+  note lane `n`.
+  Voice-local DSP and source-specific expression remain intact. Instrument-wide
+  `<effect>` buses are deliberately bypassed because their output cannot be
+  assigned back to one source lane without duplicating the instrument.
 
 ## Competitive definition of done
 
@@ -155,14 +158,15 @@ patch-lifecycle hazards.
 
 ### Phase 3 — comparison parity and output architecture
 
-- Prototype stereo lane preservation before ports and engine ownership are
-  frozen. Compare source-channel render taps, per-lane engines with shared
-  immutable samples, and a dedicated variant/expander.
-- Test instrument-wide state explicitly: sustain/sostenuto, choke/off groups,
-  keyswitches, round robins, random selection, voice limits, and release tails
-  must not become 16 unrelated instruments by accident.
-- If viable, add `POLY LEFT` and `POLY RIGHT`, where output channel `n` contains
-  only Rack input lane `n`, while retaining the mixed `LEFT`/`RIGHT` contract.
+- **Implemented:** sfizioso exposes a source-channel render tap after voice DSP
+  and before shared effects. Cella keeps the existing two output jacks and adds
+  a persisted `POLY` switch rather than adding another port pair.
+- **Tested:** sustain/sostenuto, choke/off groups, keyswitches, round robins,
+  random selection, voice limits, and release tails retain their defined shared
+  or source-scoped behavior while audio remains on the triggering Rack lane.
+- **Implemented:** with `POLY` enabled, both `LEFT` and `RIGHT` carry one channel
+  per V/OCT lane and channel `n` contains only Rack input lane `n`. With it
+  disabled, the original mixed `LEFT`/`RIGHT` contract is unchanged.
 - Add polyphonic `BEND`/exponential FM, gate/pitch trigger-delay selection, and
   a keyswitch selector with engine labels so the common Squinky performance
   patch can be reproduced.

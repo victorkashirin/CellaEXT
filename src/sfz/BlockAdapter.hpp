@@ -22,6 +22,8 @@ public:
 
     bool push(const TimedEngineEvent& event) noexcept;
     bool render(float* left, float* right, int frames) noexcept;
+    bool renderPolyphonic(float* const* left, float* const* right,
+        int channels, int frames) noexcept;
     void clear() noexcept;
 
     size_t eventCount() const noexcept { return eventCount_; }
@@ -34,6 +36,7 @@ private:
     };
 
     SamplerEngine* engine_;
+    bool enqueueEvents(int frames) noexcept;
     std::array<QueuedEvent, MaxEvents> events_ {};
     size_t eventCount_ { 0 };
     size_t droppedEventCount_ { 0 };

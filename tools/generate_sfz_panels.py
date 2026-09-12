@@ -98,6 +98,7 @@ LABELS = (
     Label("VELOCITY", 145, 238, 8),
     Label("LEFT / MONO", 62, 304, 8),
     Label("RIGHT", 118, 304, 8),
+    Label("POLY", 90, 358, 7),
     Label("CELLA", 90, 375, 7, 4),
 )
 
