@@ -51,6 +51,7 @@ public:
     bool reset(EventWriter* writer = nullptr, uint32_t frameOffset = 0) noexcept;
 
     size_t laneCount() const noexcept { return laneCount_; }
+    size_t activeCount() const noexcept;
     bool noteActive(size_t lane) const noexcept;
     uint8_t activeNote(size_t lane) const noexcept;
 

@@ -1,6 +1,7 @@
 #include "components.hpp"
 #include "plugin.hpp"
 #include "sfz/BlockAdapter.hpp"
+#include "sfz/Expression.hpp"
 #include "sfz/NoteLaneTracker.hpp"
 #include "sfz/SfiziosoEngine.hpp"
 
@@ -18,6 +19,7 @@
 #include <cstdlib>
 #include <functional>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -250,13 +252,176 @@ std::string shorten(const std::string& text, size_t maximum)
     return text.substr(0, maximum - 3) + "...";
 }
 
+std::string shortenMiddle(const std::string& text, size_t maximum)
+{
+    if (text.size() <= maximum)
+        return text;
+    if (maximum <= 3)
+        return text.substr(0, maximum);
+    const size_t available = maximum - 3;
+    const size_t beginning = (available + 1) / 2;
+    return text.substr(0, beginning) + "..."
+        + text.substr(text.size() - (available - beginning));
+}
+
+bool hasSfzExtension(const std::string& path)
+{
+    std::string extension = system::getExtension(path);
+    std::transform(extension.begin(), extension.end(), extension.begin(),
+        [](unsigned char character) {
+            return static_cast<char>(std::tolower(character));
+        });
+    return extension == ".sfz";
+}
+
+std::string filenameWithoutSfzExtension(const std::string& filename)
+{
+    const std::string extension = system::getExtension(filename);
+    return hasSfzExtension(filename)
+        ? filename.substr(0, filename.size() - extension.size())
+        : filename;
+}
+
+struct FolderSnapshot {
+    std::vector<std::string> instruments;
+    size_t selectedIndex { std::numeric_limits<size_t>::max() };
+    bool inspected { false };
+
+    bool hasSelection() const noexcept
+    {
+        return selectedIndex < instruments.size();
+    }
+};
+
+FolderSnapshot snapshotSfzFolder(const std::string& selectedPath)
+{
+    FolderSnapshot snapshot;
+    if (selectedPath.empty())
+        return snapshot;
+    try {
+        const std::string selected = system::getAbsolute(selectedPath);
+        const std::string directory = system::getDirectory(selected);
+        if (directory.empty() || !system::isDirectory(directory))
+            return snapshot;
+        for (const std::string& entry : system::getEntries(directory)) {
+            if (!system::isFile(entry))
+                continue;
+            std::string extension = system::getExtension(entry);
+            std::transform(extension.begin(), extension.end(), extension.begin(),
+                [](unsigned char character) {
+                    return static_cast<char>(std::tolower(character));
+                });
+            if (extension == ".sfz")
+                snapshot.instruments.push_back(system::getAbsolute(entry));
+        }
+        snapshot.inspected = true;
+        std::sort(snapshot.instruments.begin(), snapshot.instruments.end());
+        const auto selectedIt = std::find(
+            snapshot.instruments.begin(), snapshot.instruments.end(), selected);
+        if (selectedIt != snapshot.instruments.end()) {
+            snapshot.selectedIndex = static_cast<size_t>(
+                std::distance(snapshot.instruments.begin(), selectedIt));
+        }
+    } catch (...) {
+        snapshot = {};
+    }
+    return snapshot;
+}
+
+std::string folderPosition(size_t oneBasedIndex, size_t count)
+{
+    if (oneBasedIndex == 0 || count == 0 || oneBasedIndex > count)
+        return {};
+    const size_t width = std::to_string(count).size();
+    return rack::string::f("%0*zu/%zu", static_cast<int>(width),
+        oneBasedIndex, count);
+}
+
 std::string memoryLabel(size_t bytes)
 {
+    if (bytes >= 1024ull * 1024ull * 1024ull)
+        return rack::string::f("%.1f GB", static_cast<double>(bytes)
+                / (1024.0 * 1024.0 * 1024.0));
     if (bytes >= 1024u * 1024u)
         return rack::string::f("%.1f MB", static_cast<double>(bytes) / (1024.0 * 1024.0));
     if (bytes >= 1024u)
         return rack::string::f("%.1f KB", static_cast<double>(bytes) / 1024.0);
     return rack::string::f("%zu B", bytes);
+}
+
+enum class VoicePressure : uint8_t {
+    Normal,
+    Amber,
+    Red,
+};
+
+VoicePressure voicePressureFor(int voices, int limit) noexcept
+{
+    if (limit <= 0)
+        return VoicePressure::Normal;
+    const int clampedVoices = std::max(0, voices);
+    if (static_cast<int64_t>(clampedVoices) * 100
+        >= static_cast<int64_t>(limit) * 90)
+        return VoicePressure::Red;
+    if (static_cast<int64_t>(clampedVoices) * 100
+        >= static_cast<int64_t>(limit) * 75)
+        return VoicePressure::Amber;
+    return VoicePressure::Normal;
+}
+
+class VoicePeakHold {
+public:
+    static constexpr uint64_t HoldNanoseconds = 400000000ull;
+
+    int observe(int current, uint64_t nowNanoseconds) noexcept
+    {
+        current = std::max(0, current);
+        if (nowNanoseconds >= expiresAtNanoseconds_ || current >= peak_) {
+            peak_ = current;
+            expiresAtNanoseconds_ = nowNanoseconds + HoldNanoseconds;
+        }
+        return std::max(current, peak_);
+    }
+
+    void reset() noexcept
+    {
+        peak_ = 0;
+        expiresAtNanoseconds_ = 0;
+    }
+
+private:
+    int peak_ { 0 };
+    uint64_t expiresAtNanoseconds_ { 0 };
+};
+
+enum class DisplayWarning : uint8_t {
+    None,
+    EventDrop,
+    OutputLimiting,
+};
+
+struct DisplayRuntimeSnapshot {
+    int heldLanes { 0 };
+    int activeVoices { 0 };
+    int peakVoices { 0 };
+    int voiceLimit { 0 };
+    int assignedCcCount { 0 };
+    uint64_t eventDropCount { 0 };
+    uint64_t outputLimitingCount { 0 };
+    uint64_t audioTimeNanoseconds { 0 };
+    uint64_t eventDropWarningUntilNanoseconds { 0 };
+    uint64_t outputLimitingWarningUntilNanoseconds { 0 };
+};
+
+DisplayWarning displayWarningFor(const DisplayRuntimeSnapshot& runtime) noexcept
+{
+    if (runtime.audioTimeNanoseconds
+        < runtime.eventDropWarningUntilNanoseconds)
+        return DisplayWarning::EventDrop;
+    if (runtime.audioTimeNanoseconds
+        < runtime.outputLimitingWarningUntilNanoseconds)
+        return DisplayWarning::OutputLimiting;
+    return DisplayWarning::None;
 }
 
 } // namespace
@@ -311,12 +476,35 @@ struct CellaSFZ : Module {
         CutOnRetrigger,
     };
 
+    enum class DisplayPage : uint8_t {
+        Play = 0,
+        Info = 1,
+    };
+
     struct StatusSnapshot {
+        StatusSnapshot() = default;
+        StatusSnapshot(StatusState state, std::string filename,
+            std::string message, int regionCount, size_t estimatedSampleBytes)
+            : state(state)
+            , filename(std::move(filename))
+            , message(std::move(message))
+            , regionCount(regionCount)
+            , estimatedSampleBytes(estimatedSampleBytes)
+        {
+        }
+
         StatusState state { StatusState::Unloaded };
         std::string filename;
         std::string message;
         int regionCount { 0 };
         size_t estimatedSampleBytes { 0 };
+        std::string absolutePath;
+        size_t folderIndex { 0 }; // one-based; zero means unavailable
+        size_t folderCount { 0 };
+        size_t preloadedSampleCount { 0 };
+        size_t assignableCcCount { 0 };
+        size_t keyswitchCount { 0 };
+        uint64_t generation { 0 };
     };
 
     struct EngineBundle {
@@ -326,6 +514,7 @@ struct CellaSFZ : Module {
         float sampleRate { 48000.0f };
         uint64_t generation { 0 };
         std::string sourcePath;
+        cella::sfz::InstrumentMetadata metadata;
 
         EngineBundle()
             : engine(std::make_unique<cella::sfz::SfiziosoEngine>())
@@ -343,6 +532,7 @@ struct CellaSFZ : Module {
     enum class LoadKind : uint8_t {
         Instrument,
         SampleRateRebuild,
+        Unload,
     };
 
     struct LoadRequest {
@@ -352,6 +542,7 @@ struct CellaSFZ : Module {
         float sampleRate { 48000.0f };
         float tuningHz { 440.0f };
         LoadKind kind { LoadKind::Instrument };
+        FolderSnapshot folder;
     };
 
     using EngineFactory =
@@ -376,6 +567,8 @@ struct CellaSFZ : Module {
             std::make_shared<const StatusSnapshot>();
         std::shared_ptr<const std::string> selectedPath =
             std::make_shared<const std::string>();
+        std::shared_ptr<const cella::sfz::InstrumentMetadata> instrumentMetadata =
+            std::make_shared<const cella::sfz::InstrumentMetadata>();
         std::atomic<EngineBundle*> pendingEngine { nullptr };
         std::atomic<EngineBundle*> retiredEngine { nullptr };
         std::atomic<uint64_t> pendingGeneration { 0 };
@@ -392,6 +585,7 @@ struct CellaSFZ : Module {
         std::unordered_map<uint64_t, std::string> successfulPaths;
         std::atomic<uint64_t> activeGeneration { 0 };
         std::atomic<uint64_t> newestLoadGeneration { 0 };
+        std::atomic<uint64_t> unloadGeneration { 0 };
         std::atomic<bool> stopRequested { false };
         bool workerBusy { false }; // guarded by mutex
     };
@@ -400,6 +594,8 @@ struct CellaSFZ : Module {
     std::atomic<float> observedSampleRate_ { 48000.0f };
     std::atomic<int> renderQuantumSetting_ { kDefaultRenderQuantum };
     std::atomic<TailBehavior> tailBehaviorSetting_ { TailBehavior::PreserveAll };
+    std::atomic<int> displayPageSetting_ {
+        static_cast<int>(DisplayPage::Play) };
     std::atomic<bool> sampleRateTransitionRequested_ { false };
     std::atomic<bool> quantumTransitionRequested_ { false };
     EngineBundle* activeEngine_ { nullptr }; // audio thread only
@@ -411,6 +607,20 @@ struct CellaSFZ : Module {
         captureEvents_ {};
     size_t captureEventCount_ { 0 };
     size_t droppedEventCount_ { 0 };
+    size_t publishedCaptureDrops_ { 0 };
+    size_t publishedAdapterDrops_ { 0 };
+    EngineBundle* publishedAdapterEngine_ { nullptr };
+    std::atomic<int> heldLaneCount_ { 0 };
+    std::atomic<int> activeVoiceCount_ { 0 };
+    std::atomic<int> peakVoiceCount_ { 0 };
+    std::atomic<int> voiceLimit_ { 0 };
+    std::atomic<int> assignedCcCount_ { 0 };
+    std::atomic<uint64_t> eventDropCount_ { 0 };
+    std::atomic<uint64_t> outputLimitingCount_ { 0 };
+    std::atomic<uint64_t> audioTimeNanoseconds_ { 0 };
+    std::atomic<uint64_t> eventDropWarningUntilNanoseconds_ { 0 };
+    std::atomic<uint64_t> outputLimitingWarningUntilNanoseconds_ { 0 };
+    VoicePeakHold voicePeakHold_;
     int captureFrame_ { 0 };
     int activeRenderQuantum_ { kDefaultRenderQuantum };
     int playbackFrame_ { kDefaultRenderQuantum };
@@ -419,6 +629,15 @@ struct CellaSFZ : Module {
     std::array<float, cella::sfz::MaxNoteLanes> pitchVoltages_ {};
     std::array<float, cella::sfz::MaxNoteLanes> gateVoltages_ {};
     std::array<float, cella::sfz::MaxNoteLanes> velocityVoltages_ {};
+    std::array<cella::sfz::ExpressionFeedback, 2> expressionFeedback_ {};
+    std::array<float, cella::sfz::ExpressionLaneCount> bendState_ {};
+    std::array<float, cella::sfz::ExpressionLaneCount> pressureState_ {};
+    std::array<float, cella::sfz::ExpressionLaneCount> timbreState_ {};
+    std::array<std::array<float, cella::sfz::ExpressionLaneCount>,
+        cella::sfz::NamedControlCount> namedState_ {};
+    std::array<int16_t, cella::sfz::NamedControlCount> namedAssignments_
+        { -1, -1, -1, -1 };
+    std::array<int16_t, cella::sfz::ExpressionLaneCount> articulationState_ {};
 
     enum class LifecycleFade : uint8_t {
         Steady,
@@ -431,6 +650,7 @@ struct CellaSFZ : Module {
     bool fadeInAfterRender_ { false };
     bool sampleRateTransitionActive_ { false };
     bool quantumTransitionActive_ { false };
+    bool unloadTransitionActive_ { false };
 
     explicit CellaSFZ(EngineFactory engineFactory = {})
     {
@@ -454,6 +674,10 @@ struct CellaSFZ : Module {
         configInput(VELOCITY_INPUT, "Velocity");
         configOutput(LEFT_OUTPUT, "Left / mono");
         configOutput(RIGHT_OUTPUT, "Right");
+
+        rightExpander.producerMessage = &expressionFeedback_[0];
+        rightExpander.consumerMessage = &expressionFeedback_[1];
+        resetExpressionState();
 
         loaderThread_ = std::thread([loader = loader_]() { loaderLoop(loader); });
     }
@@ -495,6 +719,12 @@ struct CellaSFZ : Module {
             &loader_->selectedPath, std::memory_order_acquire);
     }
 
+    std::shared_ptr<const cella::sfz::InstrumentMetadata> instrumentMetadata() const
+    {
+        return std::atomic_load_explicit(
+            &loader_->instrumentMetadata, std::memory_order_acquire);
+    }
+
     int renderQuantum() const noexcept
     {
         const int frames = renderQuantumSetting_.load(std::memory_order_acquire);
@@ -512,6 +742,46 @@ struct CellaSFZ : Module {
             return behavior;
         }
         return TailBehavior::PreserveAll;
+    }
+
+    DisplayPage displayPage() const noexcept
+    {
+        const int page = displayPageSetting_.load(std::memory_order_acquire);
+        return page == static_cast<int>(DisplayPage::Info)
+            ? DisplayPage::Info
+            : DisplayPage::Play;
+    }
+
+    void setDisplayPage(DisplayPage page) noexcept
+    {
+        displayPageSetting_.store(page == DisplayPage::Info
+                ? static_cast<int>(DisplayPage::Info)
+                : static_cast<int>(DisplayPage::Play),
+            std::memory_order_release);
+    }
+
+    DisplayRuntimeSnapshot displayRuntimeSnapshot() const noexcept
+    {
+        return {
+            heldLaneCount_.load(std::memory_order_acquire),
+            activeVoiceCount_.load(std::memory_order_acquire),
+            peakVoiceCount_.load(std::memory_order_acquire),
+            voiceLimit_.load(std::memory_order_acquire),
+            assignedCcCount_.load(std::memory_order_acquire),
+            eventDropCount_.load(std::memory_order_acquire),
+            outputLimitingCount_.load(std::memory_order_acquire),
+            audioTimeNanoseconds_.load(std::memory_order_acquire),
+            eventDropWarningUntilNanoseconds_.load(std::memory_order_acquire),
+            outputLimitingWarningUntilNanoseconds_.load(std::memory_order_acquire),
+        };
+    }
+
+    bool readyStatusDescribesActiveEngine(
+        const StatusSnapshot& status) const noexcept
+    {
+        return status.state == StatusState::Ready && status.generation != 0
+            && status.generation
+                == loader_->activeGeneration.load(std::memory_order_acquire);
     }
 
     void setTailBehavior(TailBehavior behavior) noexcept
@@ -564,6 +834,26 @@ struct CellaSFZ : Module {
             std::memory_order_release);
     }
 
+    static StatusSnapshot statusForRequest(const LoadRequest& request,
+        StatusState state, const std::string& message)
+    {
+        StatusSnapshot status;
+        status.state = state;
+        status.filename = system::getFilename(request.path);
+        status.message = message;
+        status.absolutePath = request.path.empty()
+            ? std::string()
+            : system::getAbsolute(request.path);
+        status.folderIndex = request.folder.hasSelection()
+            ? request.folder.selectedIndex + 1
+            : 0;
+        status.folderCount = request.folder.hasSelection()
+            ? request.folder.instruments.size()
+            : 0;
+        status.generation = request.generation;
+        return status;
+    }
+
     static bool loadGenerationIsCurrentLocked(
         const std::shared_ptr<LoaderState>& loader, uint64_t generation) noexcept
     {
@@ -595,8 +885,7 @@ struct CellaSFZ : Module {
         try {
             std::lock_guard<std::mutex> lock(loader->mutex);
             if (loadGenerationIsCurrentLocked(loader, request.generation)) {
-                publishStatus(loader,
-                    { state, system::getFilename(request.path), message, 0, 0 });
+                publishStatus(loader, statusForRequest(request, state, message));
                 if (request.kind == LoadKind::Instrument) {
                     loader->failedInstrumentRecoveryRequested.store(
                         true, std::memory_order_release);
@@ -611,6 +900,12 @@ struct CellaSFZ : Module {
     static void performLoadOnWorker(
         const std::shared_ptr<LoaderState>& loader, const LoadRequest& request)
     {
+        // An unload request exists to serialize cancellation and destruction of
+        // any pending engine on the loader worker. The active engine is faded
+        // out and detached separately at an audio block boundary.
+        if (request.kind == LoadKind::Unload)
+            return;
+
         std::string resolvedPath = request.path;
         if (!system::isFile(resolvedPath) && !request.fallbackPath.empty()
             && system::isFile(request.fallbackPath)) {
@@ -641,17 +936,34 @@ struct CellaSFZ : Module {
                 "LOAD FAILED - CHECK FILE");
             return;
         }
+        bundle->metadata = bundle->engine->instrumentMetadata();
+        FolderSnapshot folder = request.folder;
+        if (!folder.inspected
+            || system::getAbsolute(resolvedPath) != system::getAbsolute(request.path))
+            folder = snapshotSfzFolder(resolvedPath);
 
         std::lock_guard<std::mutex> lock(loader->mutex);
         if (!loadGenerationIsCurrentLocked(loader, request.generation))
             return;
         loader->requestedPath = resolvedPath;
-        StatusSnapshot ready { StatusState::Ready, filename, {},
-            report.regionCount, report.estimatedPreloadedSampleBytes };
+        StatusSnapshot ready;
+        ready.state = StatusState::Ready;
+        ready.filename = filename;
+        ready.regionCount = report.regionCount;
+        ready.estimatedSampleBytes = report.estimatedPreloadedSampleBytes;
+        ready.absolutePath = system::getAbsolute(resolvedPath);
+        ready.folderIndex = folder.hasSelection() ? folder.selectedIndex + 1 : 0;
+        ready.folderCount = folder.hasSelection() ? folder.instruments.size() : 0;
+        ready.preloadedSampleCount = report.preloadedSampleCount;
+        ready.assignableCcCount = bundle->metadata.namedControllers.size();
+        ready.keyswitchCount = bundle->metadata.latchedKeyswitches.size();
+        ready.generation = request.generation;
         std::shared_ptr<const StatusSnapshot> readyValue =
             std::make_shared<const StatusSnapshot>(ready);
         std::shared_ptr<const std::string> selected =
             std::make_shared<const std::string>(resolvedPath);
+        std::shared_ptr<const cella::sfz::InstrumentMetadata> metadata =
+            std::make_shared<const cella::sfz::InstrumentMetadata>(bundle->metadata);
         const uint64_t activeGeneration =
             loader->activeGeneration.load(std::memory_order_acquire);
         for (auto it = loader->successfulPaths.begin();
@@ -677,6 +989,8 @@ struct CellaSFZ : Module {
             std::memory_order_release);
         std::atomic_store_explicit(&loader->selectedPath, std::move(selected),
             std::memory_order_release);
+        std::atomic_store_explicit(&loader->instrumentMetadata,
+            std::move(metadata), std::memory_order_release);
         std::atomic_store_explicit(&loader->statusSnapshot, std::move(readyValue),
             std::memory_order_release);
     }
@@ -728,7 +1042,8 @@ struct CellaSFZ : Module {
     }
 
     void loadInstrument(const std::string& path,
-        const std::string& fallbackPath = {})
+        const std::string& fallbackPath = {},
+        std::optional<FolderSnapshot> folder = std::nullopt)
     {
         if (path.empty()
             || loader_->stopRequested.load(std::memory_order_acquire))
@@ -737,6 +1052,7 @@ struct CellaSFZ : Module {
         LoadRequest request;
         request.path = path;
         request.fallbackPath = fallbackPath;
+        request.folder = folder ? std::move(*folder) : snapshotSfzFolder(path);
         request.sampleRate = observedSampleRate_.load(std::memory_order_relaxed);
         request.tuningHz = 440.0f
             * std::pow(2.0f, params[TUNE_PARAM].getValue() / 1200.0f);
@@ -748,11 +1064,13 @@ struct CellaSFZ : Module {
             request.generation = loader_->newestLoadGeneration.fetch_add(
                 1, std::memory_order_acq_rel) + 1;
             loader_->requestedPath = path;
+            loader_->unloadGeneration.store(0, std::memory_order_release);
+            StatusSnapshot loading = statusForRequest(
+                request, StatusState::Loading, "LOADING");
             loader_->loadRequest = std::move(request);
             loader_->failedInstrumentRecoveryRequested.store(
                 false, std::memory_order_release);
-            publishStatus(loader_, { StatusState::Loading, system::getFilename(path),
-                "LOADING", 0, 0 });
+            publishStatus(loader_, std::move(loading));
         }
         loader_->cv.notify_one();
     }
@@ -760,6 +1078,44 @@ struct CellaSFZ : Module {
     void loadInstrumentFromUi(const std::string& path)
     {
         loadInstrument(path);
+    }
+
+    void unloadInstrumentFromUi()
+    {
+        if (loader_->stopRequested.load(std::memory_order_acquire))
+            return;
+
+        LoadRequest request;
+        request.kind = LoadKind::Unload;
+        {
+            std::lock_guard<std::mutex> lock(loader_->mutex);
+            if (loader_->stopRequested.load(std::memory_order_acquire))
+                return;
+            loader_->pendingGeneration.store(0, std::memory_order_release);
+            request.generation = loader_->newestLoadGeneration.fetch_add(
+                1, std::memory_order_acq_rel) + 1;
+            loader_->requestedPath.clear();
+            loader_->successfulPaths.clear();
+            loader_->loadRequest = request;
+            loader_->unloadGeneration.store(
+                request.generation, std::memory_order_release);
+            loader_->failedInstrumentRecoveryRequested.store(
+                false, std::memory_order_release);
+
+            const auto emptyPath = std::make_shared<const std::string>();
+            const auto emptyMetadata =
+                std::make_shared<const cella::sfz::InstrumentMetadata>();
+            const auto unloaded = std::make_shared<const StatusSnapshot>();
+            std::atomic_store_explicit(&loader_->selectedPath, emptyPath,
+                std::memory_order_release);
+            std::atomic_store_explicit(&loader_->instrumentMetadata,
+                emptyMetadata, std::memory_order_release);
+            std::atomic_store_explicit(&loader_->lastSuccessfulStatus, unloaded,
+                std::memory_order_release);
+            std::atomic_store_explicit(&loader_->statusSnapshot, unloaded,
+                std::memory_order_release);
+        }
+        loader_->cv.notify_one();
     }
 
     std::string navigationPath() const
@@ -787,31 +1143,18 @@ struct CellaSFZ : Module {
             if (directory.empty())
                 return false;
 
-            std::vector<std::string> instruments;
-            for (const std::string& entry : system::getEntries(directory)) {
-                if (!system::isFile(entry))
-                    continue;
-                std::string extension = system::getExtension(entry);
-                std::transform(extension.begin(), extension.end(), extension.begin(),
-                    [](unsigned char character) {
-                        return static_cast<char>(std::tolower(character));
-                    });
-                if (extension == ".sfz")
-                    instruments.push_back(system::getAbsolute(entry));
-            }
-            std::sort(instruments.begin(), instruments.end());
-            const auto current = std::find(
-                instruments.begin(), instruments.end(), currentAbsolute);
-            if (current == instruments.end())
+            FolderSnapshot folder = snapshotSfzFolder(currentAbsolute);
+            if (!folder.hasSelection())
                 return false;
 
-            const size_t count = instruments.size();
-            const size_t index = static_cast<size_t>(
-                std::distance(instruments.begin(), current));
+            const size_t count = folder.instruments.size();
+            const size_t index = folder.selectedIndex;
             const size_t adjacent = direction < 0
                 ? (index + count - 1) % count
                 : (index + 1) % count;
-            loadInstrumentFromUi(instruments[adjacent]);
+            const std::string adjacentPath = folder.instruments[adjacent];
+            folder.selectedIndex = adjacent;
+            loadInstrument(adjacentPath, {}, std::move(folder));
             return true;
         } catch (...) {
             return false;
@@ -850,13 +1193,273 @@ struct CellaSFZ : Module {
         request.tuningHz = 440.0f
             * std::pow(2.0f, params[TUNE_PARAM].getValue() / 1200.0f);
         request.kind = LoadKind::SampleRateRebuild;
+        StatusSnapshot loading;
+        const auto last = std::atomic_load_explicit(
+            &loader_->lastSuccessfulStatus, std::memory_order_acquire);
+        if (last)
+            loading = *last;
+        loading.state = StatusState::Loading;
+        loading.filename = system::getFilename(reloadPath);
+        loading.message = "LOADING";
+        loading.absolutePath = reloadPath;
+        loading.generation = request.generation;
         loader_->loadRequest = std::move(request);
+        loader_->unloadGeneration.store(0, std::memory_order_release);
         sampleRateTransitionRequested_.store(true, std::memory_order_release);
         loader_->failedInstrumentRecoveryRequested.store(
             false, std::memory_order_release);
-        publishStatus(loader_, { StatusState::Loading, system::getFilename(reloadPath),
-            "LOADING", 0, 0 });
+        publishStatus(loader_, std::move(loading));
         loader_->cv.notify_one();
+    }
+
+    void resetExpressionState() noexcept
+    {
+        const float unset = std::numeric_limits<float>::quiet_NaN();
+        // A freshly loaded sampler can carry non-neutral SFZ controller
+        // defaults (notably set_cc74). Force the first capture quantum to
+        // submit the host's required neutral dedicated-expression values.
+        bendState_.fill(unset);
+        pressureState_.fill(unset);
+        timbreState_.fill(unset);
+        for (auto& control : namedState_)
+            control.fill(unset);
+        namedAssignments_.fill(-1);
+        articulationState_.fill(-1);
+    }
+
+    const cella::sfz::ExpressionMessage* expressionMessage() const noexcept
+    {
+        Module* neighbor = rightExpander.module;
+        if (!neighbor || neighbor->model != modelCellaSFZExpression
+            || neighbor->isBypassed())
+            return nullptr;
+        const auto* message = static_cast<const cella::sfz::ExpressionMessage*>(
+            neighbor->leftExpander.consumerMessage);
+        return message && message->magic == cella::sfz::ExpressionMessageMagic
+            ? message
+            : nullptr;
+    }
+
+    bool pushCaptureEvent(const cella::sfz::TimedEngineEvent& event) noexcept
+    {
+        cella::sfz::EventWriter writer { captureEvents_.data(), captureEvents_.size(),
+            captureEventCount_, droppedEventCount_ };
+        const bool pushed = writer.push(event);
+        captureEventCount_ = writer.count;
+        droppedEventCount_ = writer.dropped;
+        return pushed;
+    }
+
+    void publishEventDropTelemetry() noexcept
+    {
+        uint64_t additional = 0;
+        if (droppedEventCount_ > publishedCaptureDrops_)
+            additional += droppedEventCount_ - publishedCaptureDrops_;
+        publishedCaptureDrops_ = droppedEventCount_;
+        if (publishedAdapterEngine_ != activeEngine_) {
+            publishedAdapterEngine_ = activeEngine_;
+            publishedAdapterDrops_ = 0;
+        }
+        const size_t adapterDrops = activeEngine_
+            ? activeEngine_->adapter.droppedEventCount()
+            : 0;
+        if (adapterDrops > publishedAdapterDrops_)
+            additional += adapterDrops - publishedAdapterDrops_;
+        publishedAdapterDrops_ = adapterDrops;
+        if (additional > 0) {
+            eventDropCount_.fetch_add(additional, std::memory_order_release);
+            eventDropWarningUntilNanoseconds_.store(
+                audioTimeNanoseconds_.load(std::memory_order_relaxed)
+                    + 1000000000ull,
+                std::memory_order_release);
+        }
+    }
+
+    void updateBendExpression(
+        const cella::sfz::ExpressionMessage* message) noexcept
+    {
+        for (size_t lane = 0; lane < bendState_.size(); ++lane) {
+            const float volts = message
+                ? cella::sfz::polyVoltageForLane(message->inputs[0], lane, 0.0f)
+                : 0.0f;
+            const float semitones = 12.0f * volts;
+            if (!std::isfinite(bendState_[lane])
+                || std::abs(semitones - bendState_[lane])
+                    >= cella::sfz::NoteLaneTracker::PitchChangeThresholdSemitones) {
+                if (pushCaptureEvent(cella::sfz::TimedEngineEvent::noteBend(
+                        static_cast<uint32_t>(captureFrame_),
+                        static_cast<uint8_t>(lane), semitones)))
+                    bendState_[lane] = semitones;
+            }
+        }
+    }
+
+    void updateQuantumExpression(
+        const cella::sfz::ExpressionMessage* message) noexcept
+    {
+        const auto normalizedFor = [message](size_t input, size_t lane,
+                                       float fallback) noexcept {
+            return message
+                ? cella::sfz::normalizedVoltage(
+                      cella::sfz::polyVoltageForLane(
+                          message->inputs[input], lane, fallback * 10.0f))
+                : fallback;
+        };
+        for (size_t lane = 0; lane < cella::sfz::ExpressionLaneCount; ++lane) {
+            const float pressure = normalizedFor(1, lane, 0.0f);
+            if (!std::isfinite(pressureState_[lane])
+                || pressure != pressureState_[lane]) {
+                if (pushCaptureEvent(cella::sfz::TimedEngineEvent::pressure(
+                        0, static_cast<uint8_t>(lane), pressure)))
+                    pressureState_[lane] = pressure;
+            }
+            const float timbre = normalizedFor(2, lane, 0.0f);
+            if (!std::isfinite(timbreState_[lane])
+                || timbre != timbreState_[lane]) {
+                if (pushCaptureEvent(cella::sfz::TimedEngineEvent::timbre(
+                        0, static_cast<uint8_t>(lane), timbre)))
+                    timbreState_[lane] = timbre;
+            }
+        }
+
+        const cella::sfz::InstrumentMetadata* metadata =
+            activeEngine_ ? &activeEngine_->metadata : nullptr;
+        std::array<int16_t, cella::sfz::NamedControlCount> assignments;
+        for (size_t slot = 0; slot < cella::sfz::NamedControlCount; ++slot) {
+            const int requested = message ? message->assignments[slot] : -1;
+            const cella::sfz::NamedController* controller = metadata
+                ? cella::sfz::findNamedController(*metadata, requested)
+                : nullptr;
+            assignments[slot] = static_cast<int16_t>(controller ? requested : -1);
+        }
+        // A CC has one effective value per lane. If an old patch or an
+        // incompatible sender supplies duplicate assignments, the last slot
+        // owns it deterministically, matching the expander's UI behavior.
+        for (size_t slot = 0; slot < assignments.size(); ++slot) {
+            if (assignments[slot] < 0)
+                continue;
+            for (size_t later = slot + 1; later < assignments.size(); ++later) {
+                if (assignments[later] == assignments[slot]) {
+                    assignments[slot] = -1;
+                    break;
+                }
+            }
+        }
+
+        std::array<bool, 128> forceController {};
+        for (size_t slot = 0; slot < assignments.size(); ++slot) {
+            const int oldAssignment = namedAssignments_[slot];
+            const int assignment = assignments[slot];
+            if (oldAssignment >= 0 && oldAssignment != assignment && metadata) {
+                const bool stillOwned = std::find(assignments.begin(), assignments.end(),
+                                            oldAssignment)
+                    != assignments.end();
+                if (stillOwned) {
+                    forceController[oldAssignment] = true;
+                    continue;
+                }
+                const cella::sfz::NamedController* old =
+                    cella::sfz::findNamedController(
+                        *metadata, oldAssignment);
+                if (old) {
+                    for (size_t lane = 0; lane < cella::sfz::ExpressionLaneCount;
+                         ++lane) {
+                        pushCaptureEvent(cella::sfz::TimedEngineEvent::sourceCC(
+                            0, static_cast<uint8_t>(lane), old->number,
+                            old->defaultValue));
+                    }
+                }
+            }
+        }
+
+        for (size_t slot = 0; slot < assignments.size(); ++slot) {
+            const int assignment = assignments[slot];
+            if (assignment < 0) {
+                namedState_[slot].fill(std::numeric_limits<float>::quiet_NaN());
+                namedAssignments_[slot] = -1;
+                continue;
+            }
+            const cella::sfz::NamedController* controller =
+                cella::sfz::findNamedController(*metadata, assignment);
+            for (size_t lane = 0; lane < cella::sfz::ExpressionLaneCount; ++lane) {
+                const float value = normalizedFor(3 + slot, lane,
+                    controller->defaultValue);
+                if (namedAssignments_[slot] != assignment
+                    || forceController[assignment]
+                    || !std::isfinite(namedState_[slot][lane])
+                    || value != namedState_[slot][lane]) {
+                    if (pushCaptureEvent(cella::sfz::TimedEngineEvent::sourceCC(
+                            0, static_cast<uint8_t>(lane), controller->number,
+                            value)))
+                        namedState_[slot][lane] = value;
+                }
+            }
+            namedAssignments_[slot] = static_cast<int16_t>(assignment);
+        }
+        assignedCcCount_.store(static_cast<int>(std::count_if(
+                assignments.begin(), assignments.end(),
+                [](int16_t assignment) { return assignment >= 0; })),
+            std::memory_order_release);
+    }
+
+    void updateArticulations(
+        const cella::sfz::ExpressionMessage* message) noexcept
+    {
+        // With no compatible expander, leave sfizioso's sw_default/current
+        // switch untouched. Disconnecting or bypassing the expander likewise
+        // preserves the last explicitly selected articulation.
+        if (!message)
+            return;
+        const auto* metadata = activeEngine_ ? &activeEngine_->metadata : nullptr;
+        const size_t count = metadata ? metadata->latchedKeyswitches.size() : 0;
+        const size_t lanes = std::clamp<size_t>(
+            std::max<int>(1, inputs[VOCT_INPUT].getChannels()), 1,
+            cella::sfz::ExpressionLaneCount);
+        for (size_t lane = 0; lane < lanes; ++lane) {
+            const int desired = message->articulationIndices[lane];
+            const int selected = desired >= 0
+                    && static_cast<size_t>(desired) < count
+                ? desired
+                : -1;
+            // Negative/invalid selection means that the expander has not
+            // requested an override. Preserve sfizioso's sw_default or the
+            // last explicit manual/CV selection.
+            if (selected < 0)
+                continue;
+            if (selected == articulationState_[lane])
+                continue;
+            const uint8_t note = metadata->latchedKeyswitches[selected].note;
+            pushCaptureEvent(cella::sfz::TimedEngineEvent::keyswitchOn(
+                0, static_cast<uint8_t>(lane), note));
+            pushCaptureEvent(cella::sfz::TimedEngineEvent::keyswitchOff(
+                static_cast<uint32_t>(std::min(1, activeRenderQuantum_ - 1)),
+                static_cast<uint8_t>(lane), note));
+            articulationState_[lane] = static_cast<int16_t>(selected);
+        }
+    }
+
+    void publishExpressionFeedback() noexcept
+    {
+        if (!rightExpander.producerMessage)
+            return;
+        auto& feedback = *static_cast<cella::sfz::ExpressionFeedback*>(
+            rightExpander.producerMessage);
+        feedback = {};
+        feedback.magic = cella::sfz::ExpressionMessageMagic;
+        feedback.metadataGeneration = activeEngine_
+            ? static_cast<uint32_t>(activeEngine_->generation)
+            : 0;
+        feedback.activeLanes = static_cast<uint8_t>(std::clamp<size_t>(
+            std::max<int>(1, inputs[VOCT_INPUT].getChannels()), 1,
+            cella::sfz::ExpressionLaneCount));
+        if (activeEngine_) {
+            feedback.keyswitchCount = static_cast<uint8_t>(std::min<size_t>(
+                activeEngine_->metadata.latchedKeyswitches.size(), 128));
+            for (const auto& control : activeEngine_->metadata.namedControllers)
+                feedback.assignableCCs[control.number] = 1;
+        }
+        feedback.activeArticulations = articulationState_;
+        rightExpander.messageFlipRequested = true;
     }
 
     bool swapEngineAtBlockBoundary() noexcept
@@ -886,17 +1489,79 @@ struct CellaSFZ : Module {
         }
         EngineBundle* previous = activeEngine_;
         activeEngine_ = next;
-        loader_->activeGeneration.store(next->generation, std::memory_order_release);
         lanes_.reset();
+        resetExpressionState();
+        heldLaneCount_.store(0, std::memory_order_release);
+        activeVoiceCount_.store(0, std::memory_order_release);
+        voicePeakHold_.reset();
+        peakVoiceCount_.store(0, std::memory_order_release);
+        voiceLimit_.store(std::max(0, next->engine->voiceLimit()),
+            std::memory_order_release);
+        assignedCcCount_.store(0, std::memory_order_release);
+        // Warning holds describe the engine which produced them. Keep their
+        // counters monotonic, but do not carry an old engine's overlay onto
+        // the newly activated instrument.
+        eventDropWarningUntilNanoseconds_.store(0, std::memory_order_release);
+        outputLimitingWarningUntilNanoseconds_.store(0,
+            std::memory_order_release);
         captureEventCount_ = 0;
         playbackLeft_.fill(0.0f);
         playbackRight_.fill(0.0f);
         activeRenderQuantum_ = renderQuantum();
         playbackFrame_ = activeRenderQuantum_;
+        // Publish activation only after every runtime value has been reset for
+        // this generation. The UI uses this release point before showing READY.
+        loader_->activeGeneration.store(next->generation, std::memory_order_release);
         if (previous)
             loader_->retiredEngine.store(previous, std::memory_order_release);
         sampleRateTransitionActive_ = false;
         quantumTransitionActive_ = false;
+        return true;
+    }
+
+    bool unloadActiveEngineAtBlockBoundary(uint64_t generation) noexcept
+    {
+        if (generation == 0
+            || generation
+                != loader_->newestLoadGeneration.load(std::memory_order_acquire)
+            || generation
+                != loader_->unloadGeneration.load(std::memory_order_acquire)) {
+            return false;
+        }
+        // As with replacement, never destroy an engine or overwrite the
+        // single retirement handoff on the audio thread.
+        if (loader_->retiredEngine.load(std::memory_order_acquire))
+            return false;
+
+        EngineBundle* previous = activeEngine_;
+        activeEngine_ = nullptr;
+        lanes_.reset();
+        resetExpressionState();
+        heldLaneCount_.store(0, std::memory_order_release);
+        activeVoiceCount_.store(0, std::memory_order_release);
+        voicePeakHold_.reset();
+        peakVoiceCount_.store(0, std::memory_order_release);
+        voiceLimit_.store(0, std::memory_order_release);
+        assignedCcCount_.store(0, std::memory_order_release);
+        eventDropWarningUntilNanoseconds_.store(0, std::memory_order_release);
+        outputLimitingWarningUntilNanoseconds_.store(0, std::memory_order_release);
+        publishedCaptureDrops_ = droppedEventCount_;
+        publishedAdapterDrops_ = 0;
+        publishedAdapterEngine_ = nullptr;
+        captureEventCount_ = 0;
+        playbackLeft_.fill(0.0f);
+        playbackRight_.fill(0.0f);
+        playbackFrame_ = activeRenderQuantum_;
+        fadeInAfterRender_ = false;
+        sampleRateTransitionActive_ = false;
+        quantumTransitionActive_ = false;
+        unloadTransitionActive_ = false;
+        loader_->activeGeneration.store(0, std::memory_order_release);
+        uint64_t expected = generation;
+        loader_->unloadGeneration.compare_exchange_strong(expected, 0,
+            std::memory_order_acq_rel, std::memory_order_acquire);
+        if (previous)
+            loader_->retiredEngine.store(previous, std::memory_order_release);
         return true;
     }
 
@@ -919,6 +1584,30 @@ struct CellaSFZ : Module {
 
     void beginCaptureBlock() noexcept
     {
+        const uint64_t unloadGeneration =
+            loader_->unloadGeneration.load(std::memory_order_acquire);
+        const bool unloadIsCurrent = unloadGeneration != 0
+            && unloadGeneration
+                == loader_->newestLoadGeneration.load(std::memory_order_acquire);
+        if (unloadTransitionActive_ && !unloadIsCurrent) {
+            // A newer load superseded the unload before detachment. Restore the
+            // still-active engine while that replacement is being prepared.
+            unloadTransitionActive_ = false;
+            if (!sampleRateTransitionActive_ && !quantumTransitionActive_)
+                lifecycleFade_ = LifecycleFade::FadingIn;
+        }
+        if (unloadIsCurrent && activeEngine_) {
+            unloadTransitionActive_ = true;
+            if (lifecycleFade_ == LifecycleFade::Steady
+                || lifecycleFade_ == LifecycleFade::FadingIn) {
+                lifecycleFade_ = LifecycleFade::FadingOut;
+            }
+        } else if (unloadIsCurrent && !activeEngine_) {
+            uint64_t expected = unloadGeneration;
+            loader_->unloadGeneration.compare_exchange_strong(expected, 0,
+                std::memory_order_acq_rel, std::memory_order_acquire);
+        }
+
         if (quantumTransitionRequested_.exchange(false,
                 std::memory_order_acq_rel)
             && activeEngine_) {
@@ -945,9 +1634,14 @@ struct CellaSFZ : Module {
             && (lifecycleFade_ == LifecycleFade::FadingOut
                 || lifecycleFade_ == LifecycleFade::Silent)
             && !sampleRateTransitionActive_ && !quantumTransitionActive_
-            && !pendingReady) {
+            && !unloadTransitionActive_ && !pendingReady) {
             fadeInAfterRender_ = false;
             lifecycleFade_ = LifecycleFade::FadingIn;
+        }
+
+        if (activeEngine_ && lifecycleFade_ == LifecycleFade::Silent
+            && unloadTransitionActive_ && unloadIsCurrent) {
+            unloadActiveEngineAtBlockBoundary(unloadGeneration);
         }
 
         if (!activeEngine_ && pendingReady) {
@@ -988,10 +1682,14 @@ struct CellaSFZ : Module {
             activeEngine_->engine->setTuningFrequency(tuningHz);
             activeEngine_->appliedTuningHz = tuningHz;
         }
+        const cella::sfz::ExpressionMessage* message = expressionMessage();
+        updateQuantumExpression(message);
+        updateArticulations(message);
     }
 
     void captureInputFrame() noexcept
     {
+        updateBendExpression(expressionMessage());
         const int pitchChannels = std::clamp(inputs[VOCT_INPUT].getChannels(),
             0, static_cast<int>(cella::sfz::MaxNoteLanes));
         const int gateChannels = std::clamp(inputs[GATE_INPUT].getChannels(),
@@ -1019,6 +1717,9 @@ struct CellaSFZ : Module {
             writer);
         captureEventCount_ = writer.count;
         droppedEventCount_ = writer.dropped;
+        heldLaneCount_.store(static_cast<int>(lanes_.activeCount()),
+            std::memory_order_release);
+        publishEventDropTelemetry();
     }
 
     void finishCaptureBlock() noexcept
@@ -1046,6 +1747,15 @@ struct CellaSFZ : Module {
             }
             activeEngine_->adapter.render(playbackLeft_.data(), playbackRight_.data(),
                 activeRenderQuantum_);
+            const int activeVoices =
+                std::max(0, activeEngine_->engine->activeVoiceCount());
+            activeVoiceCount_.store(activeVoices, std::memory_order_release);
+            peakVoiceCount_.store(voicePeakHold_.observe(activeVoices,
+                    audioTimeNanoseconds_.load(std::memory_order_relaxed)),
+                std::memory_order_release);
+            voiceLimit_.store(std::max(0, activeEngine_->engine->voiceLimit()),
+                std::memory_order_release);
+            publishEventDropTelemetry();
         }
         captureEventCount_ = 0;
         playbackFrame_ = 0;
@@ -1100,6 +1810,10 @@ struct CellaSFZ : Module {
     void process(const ProcessArgs& args) override
     {
         observedSampleRate_.store(args.sampleRate, std::memory_order_relaxed);
+        const uint64_t nanosecondsPerSample = static_cast<uint64_t>(std::max(
+            1.0, std::floor(1000000000.0 / std::max(1.0f, args.sampleRate))));
+        audioTimeNanoseconds_.fetch_add(
+            nanosecondsPerSample, std::memory_order_release);
 
         float left = 0.0f;
         float right = 0.0f;
@@ -1117,10 +1831,22 @@ struct CellaSFZ : Module {
             captureFrame_ = 0;
         }
 
+        publishExpressionFeedback();
+
         const float gain = params[LEVEL_PARAM].getValue() * kNominalOutputVolts;
         const float lifecycleGain = advanceLifecycleFade(args.sampleRate);
-        left = softLimit(left * gain * lifecycleGain);
-        right = softLimit(right * gain * lifecycleGain);
+        const float scaledLeft = left * gain * lifecycleGain;
+        const float scaledRight = right * gain * lifecycleGain;
+        if (std::abs(scaledLeft) > kLimiterKneeVolts
+            || std::abs(scaledRight) > kLimiterKneeVolts) {
+            outputLimitingCount_.fetch_add(1, std::memory_order_release);
+            outputLimitingWarningUntilNanoseconds_.store(
+                audioTimeNanoseconds_.load(std::memory_order_relaxed)
+                    + 1000000000ull,
+                std::memory_order_release);
+        }
+        left = softLimit(scaledLeft);
+        right = softLimit(scaledRight);
         outputs[LEFT_OUTPUT].setChannels(1);
         outputs[RIGHT_OUTPUT].setChannels(1);
         if (!outputs[RIGHT_OUTPUT].isConnected())
@@ -1137,6 +1863,8 @@ struct CellaSFZ : Module {
         json_object_set_new(root, "renderQuantum", json_integer(renderQuantum()));
         json_object_set_new(root, "tailBehavior",
             json_string(tailBehaviorKey(tailBehavior())));
+        json_object_set_new(root, "displayPage",
+            json_integer(static_cast<int>(displayPage())));
         const std::shared_ptr<const std::string> path = selectedPath();
         if (path && !path->empty()) {
             json_object_set_new(root, "sfzPath",
@@ -1157,6 +1885,10 @@ struct CellaSFZ : Module {
                 json_integer(static_cast<json_int_t>(std::min<size_t>(
                     last->estimatedSampleBytes,
                     static_cast<size_t>(INT64_MAX)))));
+            json_object_set_new(status, "preloadedSampleCount",
+                json_integer(static_cast<json_int_t>(std::min<size_t>(
+                    last->preloadedSampleCount,
+                    static_cast<size_t>(INT64_MAX)))));
             json_object_set_new(root, "lastSuccessfulLoad", status);
         }
         return root;
@@ -1164,6 +1896,15 @@ struct CellaSFZ : Module {
 
     void dataFromJson(json_t* root) override
     {
+        DisplayPage page = DisplayPage::Play;
+        if (json_t* pageValue = json_object_get(root, "displayPage");
+            json_is_integer(pageValue)
+            && json_integer_value(pageValue)
+                == static_cast<int>(DisplayPage::Info)) {
+            page = DisplayPage::Info;
+        }
+        setDisplayPage(page);
+
         if (json_t* quantumValue = json_object_get(root, "renderQuantum");
             json_is_integer(quantumValue)) {
             const int frames = static_cast<int>(json_integer_value(quantumValue));
@@ -1201,6 +1942,7 @@ struct CellaSFZ : Module {
 
         int regions = 0;
         size_t bytes = 0;
+        size_t preloadedSamples = 0;
         if (json_t* status = json_object_get(root, "lastSuccessfulLoad")) {
             if (json_t* regionsValue = json_object_get(status, "regionCount");
                 json_is_integer(regionsValue))
@@ -1209,9 +1951,20 @@ struct CellaSFZ : Module {
                 json_is_integer(bytesValue))
                 bytes = static_cast<size_t>(std::max<json_int_t>(
                     0, json_integer_value(bytesValue)));
+            if (json_t* samplesValue = json_object_get(status,
+                    "preloadedSampleCount");
+                json_is_integer(samplesValue)) {
+                preloadedSamples = static_cast<size_t>(std::max<json_int_t>(
+                    0, json_integer_value(samplesValue)));
+            }
         }
-        const StatusSnapshot rememberedStatus { StatusState::Ready,
-            system::getFilename(remembered), {}, regions, bytes };
+        StatusSnapshot rememberedStatus;
+        rememberedStatus.state = StatusState::Ready;
+        rememberedStatus.filename = system::getFilename(remembered);
+        rememberedStatus.regionCount = regions;
+        rememberedStatus.estimatedSampleBytes = bytes;
+        rememberedStatus.absolutePath = remembered;
+        rememberedStatus.preloadedSampleCount = preloadedSamples;
         std::shared_ptr<const StatusSnapshot> last =
             std::make_shared<const StatusSnapshot>(rememberedStatus);
         std::atomic_store_explicit(&loader_->lastSuccessfulStatus, last,
@@ -1227,18 +1980,216 @@ struct CellaSFZ : Module {
     }
 };
 
-struct CellaSFZStatusDisplay : TransparentWidget {
+constexpr size_t kDisplayTitleCharacters = 27;
+constexpr size_t kDisplayTitleWithPositionCharacters = 18;
+
+enum class DisplayColorRole : uint8_t {
+    Normal,
+    Amber,
+    Red,
+};
+
+DisplayColorRole displayColorRoleForStatus(
+    CellaSFZ::StatusState state) noexcept
+{
+    return state == CellaSFZ::StatusState::Error
+            || state == CellaSFZ::StatusState::Missing
+        ? DisplayColorRole::Red
+        : DisplayColorRole::Normal;
+}
+
+DisplayColorRole displayColorRoleForWarning(DisplayWarning warning) noexcept
+{
+    if (warning == DisplayWarning::EventDrop)
+        return DisplayColorRole::Red;
+    if (warning == DisplayWarning::OutputLimiting)
+        return DisplayColorRole::Amber;
+    return DisplayColorRole::Normal;
+}
+
+DisplayColorRole displayColorRoleForPressure(VoicePressure pressure) noexcept
+{
+    if (pressure == VoicePressure::Red)
+        return DisplayColorRole::Red;
+    if (pressure == VoicePressure::Amber)
+        return DisplayColorRole::Amber;
+    return DisplayColorRole::Normal;
+}
+
+struct ReadyDisplayLayout {
+    std::string title;
+    std::string position;
+    std::string middleLeft;
+    std::string middleRight;
+    std::string bottomLeft;
+    std::string bottomRight;
+};
+
+ReadyDisplayLayout readyDisplayLayout(
+    const CellaSFZ::StatusSnapshot& status, CellaSFZ::DisplayPage page,
+    const DisplayRuntimeSnapshot& runtime, DisplayWarning warning)
+{
+    ReadyDisplayLayout layout;
+    const std::string position = folderPosition(status.folderIndex,
+        status.folderCount);
+    const std::string filename = filenameWithoutSfzExtension(status.filename);
+    layout.position = position;
+    layout.title = shortenMiddle(filename, position.empty()
+            ? kDisplayTitleCharacters
+            : kDisplayTitleWithPositionCharacters);
+    if (page == CellaSFZ::DisplayPage::Play) {
+        const int limit = std::max(0, runtime.voiceLimit);
+        const int voiceWidth = std::max<int>(3,
+            static_cast<int>(std::to_string(limit).size()));
+        layout.middleLeft = rack::string::f("Held %02d",
+            std::max(0, runtime.heldLanes));
+        layout.middleRight = rack::string::f("Voices %0*d / %d", voiceWidth,
+            std::max(0, runtime.activeVoices), limit);
+        layout.bottomLeft = rack::string::f("Controls %d / %zu",
+            std::clamp(runtime.assignedCcCount, 0,
+                static_cast<int>(std::min<size_t>(
+                    status.assignableCcCount,
+                    cella::sfz::NamedControlCount))),
+            status.assignableCcCount);
+        layout.bottomRight = rack::string::f("Switches %zu",
+            status.keyswitchCount);
+    } else {
+        layout.middleLeft = rack::string::f("Regions %d",
+            std::max(0, status.regionCount));
+        layout.middleRight = rack::string::f("Samples %zu",
+            status.preloadedSampleCount);
+        const std::string bytes = memoryLabel(status.estimatedSampleBytes);
+        layout.bottomLeft = rack::string::f("Preload %s%s",
+            status.estimatedSampleBytes == 0 ? "" : "~", bytes.c_str());
+    }
+    if (warning == DisplayWarning::EventDrop) {
+        layout.bottomLeft = "EVENT DROP";
+        layout.bottomRight.clear();
+    } else if (warning == DisplayWarning::OutputLimiting) {
+        layout.bottomLeft = "OUTPUT LIMITING";
+        layout.bottomRight.clear();
+    }
+    return layout;
+}
+
+struct CellaSFZStatusDisplay : LedDisplay {
     CellaSFZ* module { nullptr };
+    std::function<void()> loadAction;
+    ui::Tooltip* tooltip_ { nullptr };
+
+    ~CellaSFZStatusDisplay() override
+    {
+        destroyTooltip();
+    }
+
+    void destroyTooltip()
+    {
+        if (!tooltip_)
+            return;
+        if (tooltip_->parent)
+            tooltip_->parent->removeChild(tooltip_);
+        delete tooltip_;
+        tooltip_ = nullptr;
+    }
+
+    std::string tooltipText() const
+    {
+        if (!module)
+            return {};
+        const auto status = module->statusSnapshot();
+        if (!status)
+            return {};
+        std::string text = status->absolutePath;
+        if (text.empty()) {
+            const auto selected = module->selectedPath();
+            if (selected)
+                text = *selected;
+        }
+        if (module->displayPage() == CellaSFZ::DisplayPage::Info) {
+            if (!text.empty())
+                text += "\n";
+            text += "Preload is an estimate of sfizioso preload buffers; "
+                    "it is not process RAM or total instrument size.";
+        }
+        return text;
+    }
+
+    void onHover(const event::Hover& event) override
+    {
+        event.consume(this);
+    }
+
+    void appendDisplayContextMenu(ui::Menu* menu)
+    {
+        menu->addChild(createMenuLabel("SFZ instrument"));
+        menu->addChild(createMenuItem("Load SFZ...", "", loadAction,
+            !static_cast<bool>(loadAction)));
+        const bool canUnload = module
+            && (module->statusSnapshot()->state
+                    != CellaSFZ::StatusState::Unloaded
+                || !module->navigationPath().empty());
+        menu->addChild(createMenuItem("Unload instrument", "", [module = module]() {
+            if (module)
+                module->unloadInstrumentFromUi();
+        }, !canUnload));
+    }
+
+    void openContextMenu()
+    {
+        ui::Menu* menu = createMenu();
+        appendDisplayContextMenu(menu);
+    }
+
+    void onButton(const event::Button& event) override
+    {
+        if (event.action == GLFW_PRESS
+            && event.button == GLFW_MOUSE_BUTTON_RIGHT
+            && (event.mods & RACK_MOD_MASK) == 0) {
+            openContextMenu();
+            event.consume(this);
+        }
+    }
+
+    void onPathDrop(const PathDropEvent& event) override
+    {
+        if (!module)
+            return;
+        for (const std::string& path : event.paths) {
+            if (!hasSfzExtension(path) || !system::isFile(path))
+                continue;
+            module->loadInstrumentFromUi(path);
+            event.consume(this);
+            return;
+        }
+    }
+
+    void onEnter(const event::Enter& event) override
+    {
+        Widget::onEnter(event);
+        const std::string text = tooltipText();
+        if (!settings::tooltips || text.empty() || tooltip_)
+            return;
+        tooltip_ = new ui::Tooltip;
+        tooltip_->text = text;
+        APP->scene->addChild(tooltip_);
+    }
+
+    void onLeave(const event::Leave& event) override
+    {
+        Widget::onLeave(event);
+        destroyTooltip();
+    }
+
+    void step() override
+    {
+        LedDisplay::step();
+        if (tooltip_)
+            tooltip_->text = tooltipText();
+    }
 
     void draw(const DrawArgs& args) override
     {
-        nvgBeginPath(args.vg);
-        nvgRoundedRect(args.vg, 0.0f, 0.0f, box.size.x, box.size.y, 4.0f);
-        nvgFillColor(args.vg, nvgRGB(0x12, 0x16, 0x1b));
-        nvgFill(args.vg);
-        nvgStrokeWidth(args.vg, 1.0f);
-        nvgStrokeColor(args.vg, nvgRGB(0x58, 0x68, 0x73));
-        nvgStroke(args.vg);
+        LedDisplay::draw(args);
 
         if (!module)
             return;
@@ -1251,50 +2202,253 @@ struct CellaSFZStatusDisplay : TransparentWidget {
         if (!font)
             return;
 
-        std::array<std::string, 3> lines;
-        NVGcolor color = nvgRGB(0x9c, 0xe5, 0xd8);
+        const NVGcolor normalColor = nvgRGB(0xf7, 0xc5, 0xad);
+        const NVGcolor mutedColor = nvgRGBA(0xf7, 0xc5, 0xad, 0xa0);
+        const NVGcolor amberColor = nvgRGB(0xf5, 0xc5, 0x72);
+        const NVGcolor redColor = nvgRGB(0xff, 0x7d, 0x78);
+        const auto colorForRole = [&](DisplayColorRole role) {
+            if (role == DisplayColorRole::Red)
+                return redColor;
+            if (role == DisplayColorRole::Amber)
+                return amberColor;
+            return normalColor;
+        };
+        const NVGcolor statusColor = colorForRole(
+            displayColorRoleForStatus(status->state));
+        DisplayRuntimeSnapshot runtime = module->displayRuntimeSnapshot();
+        DisplayWarning warning = DisplayWarning::None;
+        ReadyDisplayLayout layout;
+        std::array<std::string, 3> centeredLines;
+        bool showReadyLayout = false;
+        bool showStatusLayout = false;
+        std::string statusMessage;
+        const auto prepareStatusLayout = [&]() {
+            layout.position = folderPosition(
+                status->folderIndex, status->folderCount);
+            layout.title = shortenMiddle(
+                filenameWithoutSfzExtension(status->filename),
+                layout.position.empty()
+                    ? kDisplayTitleCharacters
+                    : kDisplayTitleWithPositionCharacters);
+            showStatusLayout = true;
+        };
         switch (status->state) {
         case CellaSFZ::StatusState::Unloaded:
-            lines[1] = "NO INSTRUMENT";
+            centeredLines[1] = "NO INSTRUMENT";
             break;
         case CellaSFZ::StatusState::Loading:
-            lines[0] = shorten(status->filename, 22);
-            lines[1] = "LOADING";
-            color = nvgRGB(0xf5, 0xc5, 0x72);
+            prepareStatusLayout();
+            statusMessage = "LOADING";
             break;
         case CellaSFZ::StatusState::Ready:
-            lines[0] = shorten(status->filename, 22);
-            lines[1] = rack::string::f("%d REGION%s", status->regionCount,
-                status->regionCount == 1 ? "" : "S");
-            lines[2] = memoryLabel(status->estimatedSampleBytes);
+            if (!module->readyStatusDescribesActiveEngine(*status)) {
+                prepareStatusLayout();
+                statusMessage = "LOADING";
+            } else {
+                warning = displayWarningFor(runtime);
+                layout = readyDisplayLayout(
+                    *status, module->displayPage(), runtime, warning);
+                showReadyLayout = true;
+            }
             break;
         case CellaSFZ::StatusState::Error:
-            lines[0] = shorten(status->filename, 22);
-            lines[1] = status->message;
-            color = nvgRGB(0xff, 0x7d, 0x78);
+            prepareStatusLayout();
+            statusMessage = status->message;
             break;
         case CellaSFZ::StatusState::Missing:
-            lines[0] = shorten(status->filename, 22);
-            lines[1] = "MISSING SFZ";
-            color = nvgRGB(0xff, 0x7d, 0x78);
+            prepareStatusLayout();
+            statusMessage = "MISSING SFZ";
             break;
         }
 
+        nvgSave(args.vg);
+        nvgScissor(args.vg, 3.0f, 3.0f,
+            box.size.x - 6.0f, box.size.y - 6.0f);
         nvgFontFaceId(args.vg, font->handle);
-        nvgFontSize(args.vg, 10.0f);
-        nvgTextAlign(args.vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
-        nvgFillColor(args.vg, color);
-        const float centerX = box.size.x * 0.5f;
-        const int first = lines[0].empty() ? 1 : 0;
-        const int last = lines[2].empty() ? 1 : 2;
-        const float lineHeight = 14.0f;
-        const float startY = box.size.y * 0.5f
-            - (last - first) * lineHeight * 0.5f;
-        for (int index = first; index <= last; ++index) {
-            if (!lines[index].empty())
-                nvgText(args.vg, centerX,
-                    startY + (index - first) * lineHeight,
-                    lines[index].c_str(), nullptr);
+
+        const auto drawFittedText = [&](const std::string& text, float x,
+                                        float y, int align, float maxWidth,
+                                        float fontSize, NVGcolor textColor) {
+            if (text.empty())
+                return;
+            nvgTextAlign(args.vg, align | NVG_ALIGN_MIDDLE);
+            nvgFontSize(args.vg, fontSize);
+            float bounds[4];
+            const float width = nvgTextBounds(args.vg, 0.0f, 0.0f,
+                text.c_str(), nullptr, bounds);
+            if (width > maxWidth)
+                fontSize = std::max(7.0f, fontSize * maxWidth / width);
+            nvgFontSize(args.vg, fontSize);
+            nvgFillColor(args.vg, textColor);
+            nvgText(args.vg, x, y, text.c_str(), nullptr);
+        };
+
+        if (showReadyLayout) {
+            const float titleWidth = layout.position.empty() ? 137.0f : 104.0f;
+            drawFittedText(layout.title, 7.0f, 13.5f, NVG_ALIGN_LEFT,
+                titleWidth, 11.0f, normalColor);
+            drawFittedText(layout.position, 151.0f, 13.5f, NVG_ALIGN_RIGHT,
+                39.0f, 9.5f, mutedColor);
+            drawFittedText(layout.middleLeft, 7.0f, 33.5f, NVG_ALIGN_LEFT,
+                65.0f, 10.5f, normalColor);
+            drawFittedText(layout.middleRight, 173.0f, 33.5f,
+                NVG_ALIGN_RIGHT, 101.0f, 10.5f, normalColor);
+
+            if (warning != DisplayWarning::None) {
+                drawFittedText(layout.bottomLeft, box.size.x * 0.5f, 55.0f,
+                    NVG_ALIGN_CENTER, box.size.x - 14.0f, 10.5f,
+                    colorForRole(displayColorRoleForWarning(warning)));
+            } else {
+                drawFittedText(layout.bottomLeft, 7.0f, 55.0f,
+                    NVG_ALIGN_LEFT, 96.0f, 10.0f, normalColor);
+                drawFittedText(layout.bottomRight, 173.0f, 55.0f,
+                    NVG_ALIGN_RIGHT, 72.0f, 10.0f, normalColor);
+            }
+        } else if (showStatusLayout) {
+            const float titleWidth = layout.position.empty() ? 137.0f : 104.0f;
+            drawFittedText(layout.title, 7.0f, 13.5f, NVG_ALIGN_LEFT,
+                titleWidth, 11.0f, statusColor);
+            drawFittedText(layout.position, 151.0f, 13.5f, NVG_ALIGN_RIGHT,
+                39.0f, 9.5f, statusColor);
+            drawFittedText(statusMessage, box.size.x * 0.5f, 43.0f,
+                NVG_ALIGN_CENTER, box.size.x - 20.0f, 12.0f, statusColor);
+        } else {
+            const std::array<float, 3> rowY { 13.5f, 32.0f, 55.0f };
+            for (size_t index = 0; index < centeredLines.size(); ++index) {
+                if (centeredLines[index].empty())
+                    continue;
+                drawFittedText(centeredLines[index], box.size.x * 0.5f,
+                    rowY[index], NVG_ALIGN_CENTER, box.size.x - 20.0f,
+                    11.5f, statusColor);
+            }
+        }
+
+        if (status->state == CellaSFZ::StatusState::Ready
+            && module->readyStatusDescribesActiveEngine(*status)
+            && module->displayPage() == CellaSFZ::DisplayPage::Play
+            && runtime.voiceLimit > 0) {
+            const int peak = std::max(runtime.activeVoices, runtime.peakVoices);
+            const float fraction = std::clamp(static_cast<float>(peak)
+                    / static_cast<float>(runtime.voiceLimit),
+                0.0f, 1.0f);
+            const NVGcolor meterColor = colorForRole(displayColorRoleForPressure(
+                voicePressureFor(peak, runtime.voiceLimit)));
+            nvgBeginPath(args.vg);
+            nvgRect(args.vg, 7.0f, 44.0f, 166.0f, 1.5f);
+            nvgFillColor(args.vg, nvgRGBA(0xf7, 0xc5, 0xad, 0x28));
+            nvgFill(args.vg);
+            if (fraction > 0.0f) {
+                nvgBeginPath(args.vg);
+                nvgRect(args.vg, 7.0f, 44.0f, 166.0f * fraction, 1.5f);
+                nvgFillColor(args.vg, meterColor);
+                nvgFill(args.vg);
+            }
+        }
+        nvgRestore(args.vg);
+    }
+};
+
+struct CellaSFZPageDot : Widget {
+    CellaSFZ* module { nullptr };
+    CellaSFZ::DisplayPage page { CellaSFZ::DisplayPage::Play };
+    ui::Tooltip* tooltip_ { nullptr };
+    bool hovered_ { false };
+    bool pressed_ { false };
+
+    ~CellaSFZPageDot() override
+    {
+        destroyTooltip();
+    }
+
+    void destroyTooltip()
+    {
+        if (!tooltip_)
+            return;
+        if (tooltip_->parent)
+            tooltip_->parent->removeChild(tooltip_);
+        delete tooltip_;
+        tooltip_ = nullptr;
+    }
+
+    std::string tooltipText() const
+    {
+        return page == CellaSFZ::DisplayPage::Play
+            ? "Show performance"
+            : "Show instrument info";
+    }
+
+    void onHover(const event::Hover& event) override
+    {
+        event.consume(this);
+    }
+
+    void onEnter(const event::Enter& event) override
+    {
+        Widget::onEnter(event);
+        hovered_ = true;
+        if (!settings::tooltips || tooltip_)
+            return;
+        tooltip_ = new ui::Tooltip;
+        tooltip_->text = tooltipText();
+        APP->scene->addChild(tooltip_);
+    }
+
+    void onLeave(const event::Leave& event) override
+    {
+        Widget::onLeave(event);
+        hovered_ = false;
+        pressed_ = false;
+        destroyTooltip();
+    }
+
+    void step() override
+    {
+        Widget::step();
+        if (tooltip_)
+            tooltip_->text = tooltipText();
+    }
+
+    void onButton(const event::Button& event) override
+    {
+        if (event.button != GLFW_MOUSE_BUTTON_LEFT)
+            return;
+        if (event.action == GLFW_PRESS) {
+            pressed_ = true;
+            if (module)
+                module->setDisplayPage(page);
+            event.consume(this);
+        } else if (event.action == GLFW_RELEASE) {
+            pressed_ = false;
+            event.consume(this);
+        }
+    }
+
+    void draw(const DrawArgs& args) override
+    {
+        const bool selected = module && module->displayPage() == page;
+        const NVGcolor primary = nvgRGB(0xf7, 0xc5, 0xad);
+        const NVGcolor bright = nvgRGB(0xff, 0xe7, 0xdc);
+        const NVGcolor color = hovered_ || pressed_ ? bright : primary;
+        const float cx = box.size.x * 0.5f;
+        const float cy = box.size.y * 0.5f;
+        if (hovered_ || pressed_) {
+            nvgBeginPath(args.vg);
+            nvgCircle(args.vg, cx, cy, pressed_ ? 4.5f : 4.0f);
+            nvgFillColor(args.vg, nvgRGBA(0xf7, 0xc5, 0xad,
+                pressed_ ? 0x38 : 0x24));
+            nvgFill(args.vg);
+        }
+        nvgBeginPath(args.vg);
+        nvgCircle(args.vg, cx, cy, selected ? 2.6f : 2.35f);
+        if (selected) {
+            nvgFillColor(args.vg, color);
+            nvgFill(args.vg);
+        } else {
+            nvgStrokeWidth(args.vg, 1.0f);
+            nvgStrokeColor(args.vg, hovered_
+                    ? color
+                    : nvgRGBA(0xf7, 0xc5, 0xad, 0x90));
+            nvgStroke(args.vg);
         }
     }
 };
@@ -1315,10 +2469,21 @@ struct CellaSFZWidget : ModuleWidget {
         addChild(createWidget<ScrewGrey>(Vec(165, 0)));
         addChild(createWidget<ScrewGrey>(Vec(165, RACK_GRID_HEIGHT - RACK_GRID_WIDTH)));
 
-        auto* display = createWidget<CellaSFZStatusDisplay>(Vec(10, 35));
-        display->box.size = Vec(160, 54);
+        auto* display = createWidget<CellaSFZStatusDisplay>(Vec(0, 25));
+        display->box.size = Vec(180, 64);
         display->module = module;
+        display->loadAction = [this]() { loadDialog(); };
         addChild(display);
+        auto* playPage = createWidget<CellaSFZPageDot>(Vec(154, 26));
+        playPage->box.size = Vec(12, 15);
+        playPage->module = module;
+        playPage->page = CellaSFZ::DisplayPage::Play;
+        addChild(playPage);
+        auto* infoPage = createWidget<CellaSFZPageDot>(Vec(166, 26));
+        infoPage->box.size = Vec(12, 15);
+        infoPage->module = module;
+        infoPage->page = CellaSFZ::DisplayPage::Info;
+        addChild(infoPage);
 
         addParam(createParamCentered<RoundBlackKnob>(Vec(35, 130), module,
             CellaSFZ::LEVEL_PARAM));
@@ -1425,4 +2590,385 @@ struct CellaSFZWidget : ModuleWidget {
     }
 };
 
-Model* modelCellaSFZ = createModel<CellaSFZ, CellaSFZWidget>("CellaSFZ");
+struct CellaSFZExpression : Module {
+    enum InputId {
+        BEND_INPUT,
+        PRESSURE_INPUT,
+        TIMBRE_INPUT,
+        CONTROL_1_INPUT,
+        CONTROL_2_INPUT,
+        CONTROL_3_INPUT,
+        CONTROL_4_INPUT,
+        ARTICULATION_INPUT,
+        INPUTS_LEN
+    };
+    enum ParamId { PARAMS_LEN };
+    enum OutputId { OUTPUTS_LEN };
+    enum LightId { LIGHTS_LEN };
+
+    static constexpr int SchemaVersion = 1;
+    std::array<cella::sfz::ExpressionMessage, 2> expressionMessages_ {};
+    std::array<std::atomic<int>, cella::sfz::NamedControlCount> assignments_;
+    std::atomic<int> manualArticulation_ { -1 };
+    std::atomic<bool> connected_ { false };
+    std::atomic<int> activeLanes_ { 1 };
+    std::array<std::atomic<int>, cella::sfz::ExpressionLaneCount>
+        activeArticulations_;
+    uint32_t sequence_ { 0 };
+    uint32_t metadataGeneration_ { 0 };
+    cella::sfz::SelectorQuantizer selectorQuantizer_;
+
+    CellaSFZExpression()
+    {
+        config(PARAMS_LEN, INPUTS_LEN, OUTPUTS_LEN, LIGHTS_LEN);
+        configInput(BEND_INPUT, "Additive 1 V/octave bend");
+        configInput(PRESSURE_INPUT, "Pressure");
+        configInput(TIMBRE_INPUT, "Timbre (CC74)");
+        for (int slot = 0; slot < 4; ++slot)
+            configInput(CONTROL_1_INPUT + slot,
+                rack::string::f("Assignable control %d", slot + 1));
+        configInput(ARTICULATION_INPUT, "Articulation select");
+        leftExpander.producerMessage = &expressionMessages_[0];
+        leftExpander.consumerMessage = &expressionMessages_[1];
+        for (auto& assignment : assignments_)
+            assignment.store(-1, std::memory_order_relaxed);
+        for (auto& articulation : activeArticulations_)
+            articulation.store(-1, std::memory_order_relaxed);
+    }
+
+    void setAssignment(size_t slot, int cc) noexcept
+    {
+        if (slot >= assignments_.size())
+            return;
+        if (cc < 0 || cc >= 128 || cc == 74 || cc == 120 || cc == 121
+            || cc == 123) {
+            assignments_[slot].store(-1, std::memory_order_relaxed);
+            return;
+        }
+        for (size_t other = 0; other < assignments_.size(); ++other) {
+            if (other != slot
+                && assignments_[other].load(std::memory_order_relaxed) == cc) {
+                assignments_[other].store(-1, std::memory_order_relaxed);
+            }
+        }
+        assignments_[slot].store(cc, std::memory_order_relaxed);
+    }
+
+    CellaSFZ* baseModule() const noexcept
+    {
+        Module* neighbor = leftExpander.module;
+        if (!neighbor || neighbor->model != modelCellaSFZ)
+            return nullptr;
+        return dynamic_cast<CellaSFZ*>(neighbor);
+    }
+
+    const cella::sfz::ExpressionFeedback* feedback() const noexcept
+    {
+        Module* neighbor = leftExpander.module;
+        if (!neighbor || neighbor->model != modelCellaSFZ
+            || neighbor->isBypassed())
+            return nullptr;
+        const auto* value = static_cast<const cella::sfz::ExpressionFeedback*>(
+            neighbor->rightExpander.consumerMessage);
+        return value && value->magic == cella::sfz::ExpressionMessageMagic
+            ? value
+            : nullptr;
+    }
+
+    void process(const ProcessArgs&) override
+    {
+        const cella::sfz::ExpressionFeedback* currentFeedback = feedback();
+        connected_.store(currentFeedback != nullptr, std::memory_order_relaxed);
+        int switchCount = 0;
+        int lanes = 1;
+        if (currentFeedback) {
+            switchCount = currentFeedback->keyswitchCount;
+            lanes = std::clamp<int>(currentFeedback->activeLanes, 1, 16);
+            activeLanes_.store(lanes, std::memory_order_relaxed);
+            for (size_t lane = 0; lane < activeArticulations_.size(); ++lane) {
+                activeArticulations_[lane].store(
+                    currentFeedback->activeArticulations[lane],
+                    std::memory_order_relaxed);
+            }
+            bool resetQuantizer = metadataGeneration_
+                != currentFeedback->metadataGeneration;
+            metadataGeneration_ = currentFeedback->metadataGeneration;
+            // Generations are local to each Cella SFZ instance, so two bases
+            // can legitimately report the same value. This bounded check must
+            // therefore run whenever feedback is present, not just when the
+            // numeric generation changes.
+            for (auto& assignment : assignments_) {
+                const int cc = assignment.load(std::memory_order_relaxed);
+                if (cc >= 0 && (cc >= 128
+                        || currentFeedback->assignableCCs[cc] == 0))
+                    assignment.store(-1, std::memory_order_relaxed);
+            }
+            const int manual = manualArticulation_.load(
+                std::memory_order_relaxed);
+            if (manual >= 0 && (switchCount == 0 || manual >= switchCount)) {
+                manualArticulation_.store(-1, std::memory_order_relaxed);
+                resetQuantizer = true;
+            }
+            if (resetQuantizer) {
+                selectorQuantizer_.reset(manualArticulation_.load(
+                    std::memory_order_relaxed));
+            }
+        } else {
+            activeLanes_.store(1, std::memory_order_relaxed);
+            for (auto& articulation : activeArticulations_)
+                articulation.store(-1, std::memory_order_relaxed);
+        }
+
+        auto& message = *static_cast<cella::sfz::ExpressionMessage*>(
+            leftExpander.producerMessage);
+        message = {};
+        message.magic = cella::sfz::ExpressionMessageMagic;
+        message.sequence = ++sequence_;
+        for (int input = 0; input < static_cast<int>(cella::sfz::ExpressionInputCount);
+             ++input) {
+            const int channels = std::clamp(inputs[input].getChannels(), 0, 16);
+            message.inputs[input].channels = static_cast<uint8_t>(channels);
+            for (int lane = 0; lane < channels; ++lane)
+                message.inputs[input].values[lane] = inputs[input].getVoltage(lane);
+        }
+        for (size_t slot = 0; slot < assignments_.size(); ++slot) {
+            message.assignments[slot] = static_cast<int16_t>(
+                assignments_[slot].load(std::memory_order_relaxed));
+        }
+
+        const int manual = manualArticulation_.load(std::memory_order_relaxed);
+        const int selectorChannels = std::clamp(
+            inputs[ARTICULATION_INPUT].getChannels(), 0, 16);
+        for (int lane = 0; lane < 16; ++lane) {
+            int selection = manual;
+            if (selectorChannels == 1) {
+                selection = selectorQuantizer_.process(lane,
+                    inputs[ARTICULATION_INPUT].getVoltage(0), switchCount);
+            } else if (selectorChannels > 1 && lane < selectorChannels) {
+                selection = selectorQuantizer_.process(lane,
+                    inputs[ARTICULATION_INPUT].getVoltage(lane), switchCount);
+            }
+            message.articulationIndices[lane] = static_cast<int16_t>(selection);
+        }
+        leftExpander.messageFlipRequested = true;
+    }
+
+    json_t* dataToJson() override
+    {
+        json_t* root = json_object();
+        json_object_set_new(root, "schemaVersion", json_integer(SchemaVersion));
+        json_t* assignments = json_array();
+        for (const auto& assignment : assignments_)
+            json_array_append_new(assignments,
+                json_integer(assignment.load(std::memory_order_relaxed)));
+        json_object_set_new(root, "assignments", assignments);
+        json_object_set_new(root, "manualArticulation",
+            json_integer(manualArticulation_.load(std::memory_order_relaxed)));
+        return root;
+    }
+
+    void dataFromJson(json_t* root) override
+    {
+        if (json_t* values = json_object_get(root, "assignments");
+            json_is_array(values)) {
+            for (size_t slot = 0; slot < assignments_.size(); ++slot) {
+                json_t* value = json_array_get(values, slot);
+                if (json_is_integer(value)) {
+                    const int cc = static_cast<int>(json_integer_value(value));
+                    setAssignment(slot, cc);
+                }
+            }
+        }
+        if (json_t* value = json_object_get(root, "manualArticulation");
+            json_is_integer(value)) {
+            manualArticulation_.store(std::clamp<int>(
+                static_cast<int>(json_integer_value(value)), -1, 127),
+                std::memory_order_relaxed);
+        }
+    }
+};
+
+std::string midiNoteName(int note)
+{
+    static constexpr const char* names[] = {
+        "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"
+    };
+    note = std::clamp(note, 0, 127);
+    return std::string(names[note % 12]) + std::to_string(note / 12 - 1);
+}
+
+struct CellaExpressionDisplay : TransparentWidget {
+    CellaSFZExpression* module { nullptr };
+    int slot { -1 }; // 0..3 named control, -1 articulation
+
+    std::shared_ptr<const cella::sfz::InstrumentMetadata> metadata() const
+    {
+        CellaSFZ* base = module ? module->baseModule() : nullptr;
+        return base ? base->instrumentMetadata() : nullptr;
+    }
+
+    std::string displayText() const
+    {
+        if (!module)
+            return slot >= 0 ? rack::string::f("CONTROL %d", slot + 1)
+                             : "ARTICULATION";
+        const auto info = metadata();
+        if (slot >= 0) {
+            const int cc = module->assignments_[slot].load(
+                std::memory_order_relaxed);
+            if (info) {
+                if (const auto* control = cella::sfz::findNamedController(*info, cc))
+                    return shorten(control->label, 20);
+            }
+            return rack::string::f("ASSIGN %d", slot + 1);
+        }
+        if (!module->connected_.load(std::memory_order_relaxed))
+            return "NO SFZ";
+        const int lanes = module->activeLanes_.load(std::memory_order_relaxed);
+        int selected = module->activeArticulations_[0].load(
+            std::memory_order_relaxed);
+        for (int lane = 1; lane < lanes; ++lane) {
+            if (module->activeArticulations_[lane].load(
+                    std::memory_order_relaxed) != selected)
+                return "POLY";
+        }
+        if (!info || info->latchedKeyswitches.empty())
+            return "NO SWITCHES";
+        if (selected < 0
+            || static_cast<size_t>(selected) >= info->latchedKeyswitches.size())
+            return "SFZ DEFAULT";
+        const auto& keyswitch = info->latchedKeyswitches[selected];
+        return shorten(keyswitch.label.empty() ? midiNoteName(keyswitch.note)
+                                                : keyswitch.label,
+            20);
+    }
+
+    void draw(const DrawArgs& args) override
+    {
+        nvgBeginPath(args.vg);
+        nvgRoundedRect(args.vg, 0, 0, box.size.x, box.size.y, 3.0f);
+        nvgFillColor(args.vg, nvgRGB(0x12, 0x16, 0x1b));
+        nvgFill(args.vg);
+        nvgStrokeWidth(args.vg, 0.8f);
+        nvgStrokeColor(args.vg, nvgRGB(0x58, 0x68, 0x73));
+        nvgStroke(args.vg);
+        const auto font = APP->window->loadFont(
+            asset::plugin(pluginInstance, "res/fonts/JetBrainsMono-Medium.ttf"));
+        if (!font)
+            return;
+        nvgFontFaceId(args.vg, font->handle);
+        nvgFontSize(args.vg, slot >= 0 ? 8.0f : 9.0f);
+        nvgTextAlign(args.vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+        nvgFillColor(args.vg, nvgRGB(0x9c, 0xe5, 0xd8));
+        const std::string text = displayText();
+        nvgText(args.vg, box.size.x * 0.5f, box.size.y * 0.5f,
+            text.c_str(), nullptr);
+    }
+
+    void appendSelectionMenu(ui::Menu* menu)
+    {
+        if (!menu || !module)
+            return;
+        const auto info = metadata();
+        if (slot >= 0) {
+            menu->addChild(createCheckMenuItem("Unassigned", "",
+                [this]() {
+                    return module->assignments_[slot].load(
+                               std::memory_order_relaxed) < 0;
+                },
+                [this]() {
+                    module->setAssignment(slot, -1);
+                }));
+            if (info) {
+                for (const auto& control : info->namedControllers) {
+                    if (control.number == 74)
+                        continue;
+                    const int cc = control.number;
+                    const std::string generic = rack::string::f("CC %d", cc);
+                    const std::string label = control.label == generic
+                        ? generic
+                        : rack::string::f("%s (CC%d)", control.label.c_str(), cc);
+                    menu->addChild(createCheckMenuItem(
+                        label, "",
+                        [this, cc]() {
+                            return module->assignments_[slot].load(
+                                       std::memory_order_relaxed) == cc;
+                        },
+                        [this, cc]() {
+                            module->setAssignment(slot, cc);
+                        }));
+                }
+            }
+        } else if (info) {
+            for (size_t index = 0; index < info->latchedKeyswitches.size(); ++index) {
+                const auto& keyswitch = info->latchedKeyswitches[index];
+                const std::string label = keyswitch.label.empty()
+                    ? midiNoteName(keyswitch.note)
+                    : keyswitch.label;
+                menu->addChild(createCheckMenuItem(label, "",
+                    [this, index]() {
+                        return module->manualArticulation_.load(
+                                   std::memory_order_relaxed)
+                            == static_cast<int>(index);
+                    },
+                    [this, index]() {
+                        module->manualArticulation_.store(static_cast<int>(index),
+                            std::memory_order_relaxed);
+                    }));
+            }
+        }
+    }
+
+    void onButton(const event::Button& event) override
+    {
+        if (event.action != GLFW_PRESS || event.button != GLFW_MOUSE_BUTTON_LEFT
+            || !module)
+            return;
+        ui::Menu* menu = createMenu();
+        appendSelectionMenu(menu);
+        event.consume(this);
+    }
+};
+
+struct CellaSFZExpressionWidget : ModuleWidget {
+    explicit CellaSFZExpressionWidget(CellaSFZExpression* module)
+    {
+        setModule(module);
+        setPanel(createPanel(
+            asset::plugin(pluginInstance, "res/CellaSFZExpression.svg"),
+            asset::plugin(pluginInstance, "res/CellaSFZExpression-dark.svg")));
+        addChild(createWidget<ScrewGrey>(Vec(0, 0)));
+        addChild(createWidget<ScrewGrey>(Vec(0, RACK_GRID_HEIGHT - RACK_GRID_WIDTH)));
+        addChild(createWidget<ScrewGrey>(Vec(165, 0)));
+        addChild(createWidget<ScrewGrey>(Vec(165, RACK_GRID_HEIGHT - RACK_GRID_WIDTH)));
+
+        for (int input = 0; input < 3; ++input) {
+            addInput(createInputCentered<ThemedPJ301MPort>(
+                Vec(35 + 55 * input, 82), module,
+                CellaSFZExpression::BEND_INPUT + input));
+        }
+        constexpr float xs[] { 48.0f, 132.0f, 48.0f, 132.0f };
+        constexpr float ys[] { 169.0f, 169.0f, 242.0f, 242.0f };
+        for (int slot = 0; slot < 4; ++slot) {
+            auto* display = createWidget<CellaExpressionDisplay>(
+                Vec(xs[slot] - 35.0f, ys[slot] - 50.0f));
+            display->box.size = Vec(70, 18);
+            display->module = module;
+            display->slot = slot;
+            addChild(display);
+            addInput(createInputCentered<ThemedPJ301MPort>(Vec(xs[slot], ys[slot]),
+                module, CellaSFZExpression::CONTROL_1_INPUT + slot));
+        }
+        auto* articulation = createWidget<CellaExpressionDisplay>(Vec(25, 292));
+        articulation->box.size = Vec(130, 22);
+        articulation->module = module;
+        articulation->slot = -1;
+        addChild(articulation);
+        addInput(createInputCentered<ThemedPJ301MPort>(Vec(90, 342), module,
+            CellaSFZExpression::ARTICULATION_INPUT));
+    }
+};
+
+Model* modelCellaSFZ = createModel<CellaSFZ, CellaSFZWidget>("SFZ");
+Model* modelCellaSFZExpression =
+    createModel<CellaSFZExpression, CellaSFZExpressionWidget>("CellaSFZExpression");

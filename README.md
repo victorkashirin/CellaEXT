@@ -22,6 +22,21 @@ Run the transferred V1 verification suite with:
 make sfz-test
 ```
 
+## SFZ Expression expander
+
+Place **SFZ Expression** directly to the right of **Cella SFZ**. Its `BEND`
+input adds polyphonic 1 V/oct pitch, while `PRESSURE`, `TIMBRE`, and the four
+assignable control inputs accept polyphonic 0–10 V expression. A monophonic
+cable broadcasts to all active note lanes.
+
+Click a control label to assign a standard CC used by the loaded instrument.
+Explicit SFZ labels take priority; otherwise the menu uses a standard MIDI name
+or a numeric `CC N` fallback. Click the articulation display to choose a
+detected latched keyswitch manually, or patch 0–10 V into `ARTICULATION`;
+polyphonic selections show `POLY` when lanes differ. Assignments are stored by
+CC number and are retained across instrument changes only when the new
+instrument exposes the same CC.
+
 ## Panel generation
 
 The checked-in light and dark panels contain outlined text and are generated

@@ -32,10 +32,13 @@ Build a usable 12 HP expander immediately to the right of Cella SFZ with:
 - a readable label for each named-control slot which opens the loaded
   instrument's assignment menu when clicked.
 
-Only CCs with explicit instrument labels appear in assignment menus. CC74 is
-excluded because the dedicated `TIMBRE` input owns it. Persist assignments by
-CC number. After an instrument change, retain an assignment only when the new
-instrument labels that same CC; otherwise leave the slot unassigned.
+Standard CCs used by the loaded instrument appear in assignment menus, as do
+CCs with explicit instrument labels. Prefer the instrument label, then a
+standard MIDI controller name, and finally `CC N` as the display fallback.
+CC74 is excluded because the dedicated `TIMBRE` input owns it; destructive MIDI
+channel-mode messages are also excluded. Persist assignments by CC number.
+After an instrument change, retain an assignment only when the new instrument
+exposes that same CC; otherwise leave the slot unassigned.
 
 ### Voltage and lane behavior
 
@@ -123,6 +126,6 @@ are not exit gates.
 - stereo lane-preserving outputs;
 - large-library streaming and shared sample caches;
 - broad compatibility diagnostics and missing-sample recovery;
-- arbitrary/unlabeled CC assignment and per-slot transforms;
+- extended CC assignment and per-slot transforms;
 - direct or momentary keyswitch modes, sustain, sostenuto, and release velocity;
 - multiple output buses, browsing, authoring, conversion, and advanced tuning.

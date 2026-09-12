@@ -6,4 +6,5 @@ void init(Plugin* plugin)
 {
     pluginInstance = plugin;
     plugin->addModel(modelCellaSFZ);
+    plugin->addModel(modelCellaSFZExpression);
 }

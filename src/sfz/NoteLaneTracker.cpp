@@ -190,6 +190,14 @@ bool NoteLaneTracker::noteActive(size_t lane) const noexcept
     return lane < laneCount_ && lanes_[lane].active;
 }
 
+size_t NoteLaneTracker::activeCount() const noexcept
+{
+    size_t count = 0;
+    for (size_t lane = 0; lane < laneCount_; ++lane)
+        count += lanes_[lane].active ? 1 : 0;
+    return count;
+}
+
 uint8_t NoteLaneTracker::activeNote(size_t lane) const noexcept
 {
     return lane < laneCount_ ? lanes_[lane].note : 0;

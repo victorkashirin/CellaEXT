@@ -23,6 +23,9 @@ public:
     void enqueue(const TimedEngineEvent& event) noexcept override;
     void render(float* left, float* right, int frames) noexcept override;
     EngineStats stats() const noexcept override;
+    int activeVoiceCount() const noexcept override;
+    int voiceLimit() const noexcept override;
+    const InstrumentMetadata& instrumentMetadata() const noexcept override;
 
 private:
     struct Impl;

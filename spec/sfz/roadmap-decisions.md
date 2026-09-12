@@ -25,12 +25,16 @@ four-gate feasibility slice. It is the durable rationale for the focused
 - Put expression on a separate 12 HP right-side expander so the Cella SFZ base
   module and its existing patch-facing IDs remain unchanged.
 - Provide dedicated polyphonic `BEND`, `PRESSURE`, and `TIMBRE` inputs.
-- Provide four generic polyphonic CV inputs. Each can be assigned only to a CC
-  carrying an explicit label in the loaded SFZ.
+- Provide four generic polyphonic CV inputs. Each can be assigned to a standard
+  CC used by the loaded instrument or carrying an explicit instrument label.
+- Prefer explicit instrument labels, then standard MIDI names, and finally a
+  numeric `CC N` fallback so unlabeled instruments remain usable.
 - Assign controls through clickable slot labels populated from instrument
   metadata.
 - Reserve CC74 for the dedicated `TIMBRE` input and omit it from generic slot
   choices.
+- Omit destructive MIDI channel-mode reset and all-notes-off messages from
+  continuous CV assignment.
 - Interpret `BEND` as an additive 1 V/octave offset, independent of the
   instrument's SFZ pitch-wheel range.
 - Make bend sample-offset accurate. Update pressure, timbre, and named CCs once
@@ -40,8 +44,8 @@ four-gate feasibility slice. It is the durable rationale for the focused
 - On cable removal, channel-count shrink, or expander removal, restore neutral
   bend/pressure/timbre and the SFZ-declared default for named CCs.
 - Persist a named-control assignment by CC number. Retain it after loading a
-  different SFZ only when that instrument explicitly labels the same CC;
-  otherwise show the slot as unassigned.
+  different SFZ only when that instrument exposes the same CC; otherwise show
+  the slot as unassigned.
 
 ### Why this is primary
 
@@ -77,7 +81,7 @@ the reference for these ideas, without implying their implementation order.
 - stereo lane-preserving outputs;
 - large-library disk streaming and shared sample caches;
 - broad compatibility diagnostics and missing-sample recovery;
-- arbitrary or unlabeled CC assignment;
+- extended CC assignment;
 - per-slot scale, offset, polarity, curve, and user smoothing;
 - momentary or direct key-and-gate keyswitch modes;
 - sustain, sostenuto, and release-velocity inputs;

@@ -1,4 +1,5 @@
 #include "sfz/BlockAdapter.hpp"
+#include "sfz/Expression.hpp"
 #include "sfz/NoteLaneTracker.hpp"
 #include "sfz/SfiziosoEngine.hpp"
 #include "sfizz/ExpressionContext.h"
@@ -210,6 +211,116 @@ void testEventOrdering()
     require(adapter.droppedEventCount() == 1, "adapter reports invalid event");
 }
 
+void testExpressionUtilities()
+{
+    requireNear(normalizedVoltage(-1.0f), 0.0f, 1.0e-6f,
+        "expression voltage low clamp");
+    requireNear(normalizedVoltage(4.25f), 0.425f, 1.0e-6f,
+        "expression voltage normalization");
+    requireNear(normalizedVoltage(12.0f), 1.0f, 1.0e-6f,
+        "expression voltage high clamp");
+
+    PolyVoltage values;
+    values.channels = 1;
+    values.values[0] = 7.0f;
+    requireNear(polyVoltageForLane(values, 15, 2.0f), 7.0f, 1.0e-6f,
+        "monophonic expression broadcasts to all lanes");
+    values.channels = 3;
+    values.values[0] = 1.0f;
+    values.values[1] = 2.0f;
+    values.values[2] = 3.0f;
+    requireNear(polyVoltageForLane(values, 2, 9.0f), 3.0f, 1.0e-6f,
+        "polyphonic expression maps by lane");
+    requireNear(polyVoltageForLane(values, 3, 9.0f), 9.0f, 1.0e-6f,
+        "polyphonic channel shrink restores lane default");
+    values.channels = 0;
+    requireNear(polyVoltageForLane(values, 0, 0.375f), 0.375f, 1.0e-6f,
+        "cable removal restores declared default");
+
+    SelectorQuantizer selector;
+    require(selector.process(0, 0.0f, 3) == 0,
+        "selector begins at first switch");
+    require(selector.process(0, 2.7f, 3) == 0,
+        "selector holds below upper hysteresis boundary");
+    require(selector.process(0, 3.0f, 3) == 1,
+        "selector advances after upper hysteresis boundary");
+    require(selector.process(0, 2.3f, 3) == 1,
+        "selector holds above lower hysteresis boundary");
+    require(selector.process(0, 2.0f, 3) == 0,
+        "selector retreats after lower hysteresis boundary");
+    require(selector.process(1, 10.0f, 3) == 2,
+        "selector lanes quantize independently");
+
+    require(TimedEngineEvent::noteBend(1, 2, 12.0f).type
+            == EngineEventType::NoteBend,
+        "fixed bend event type");
+    require(TimedEngineEvent::pressure(1, 2, 0.5f).type
+            == EngineEventType::Pressure,
+        "fixed pressure event type");
+    require(TimedEngineEvent::timbre(1, 2, 0.5f).note == 74,
+        "timbre owns CC74");
+    require(TimedEngineEvent::sourceCC(1, 2, 21, 0.5f).note == 21,
+        "fixed source CC carries its controller number");
+}
+
+void testInstrumentMetadata(const Fixtures& fixtures)
+{
+    const fs::path path = fixtures.directory / "expression.sfz";
+    std::ofstream document(path);
+    document
+        << "#define $BRIGHTNESS_CC 20\n"
+           "<control> label_cc$BRIGHTNESS_CC=Brightness "
+           "set_cc$BRIGHTNESS_CC=64 set_cc1=32 "
+           "label_cc74=Reserved set_cc74=99 label_cc120=Unsafe\n"
+           "<region> sample=*sine key=60 cutoff_oncc1=120 "
+           "resonance_oncc23=12 volume_oncc$BRIGHTNESS_CC=6 "
+           "volume_oncc74=6 pitch_oncc129=120 "
+           "sw_last=24 sw_label=Legato\n"
+           "<region> sample=*sine key=60 sw_last=25\n";
+    document.close();
+
+    SfiziosoEngine engine;
+    engine.setSampleRate(SampleRate);
+    engine.setMaximumBlockSize(64);
+    require(engine.load(path.string()).success,
+        "expression metadata fixture loads");
+    const InstrumentMetadata& metadata = engine.instrumentMetadata();
+    require(metadata.namedControllers.size() == 6,
+        "used and explicitly labeled standard controls are exposed");
+    require(metadata.namedControllers[0].number == 1
+            && metadata.namedControllers[0].label == "Modulation",
+        "unlabeled used controller receives a standard MIDI name");
+    requireNear(metadata.namedControllers[0].defaultValue, 32.0f / 127.0f,
+        1.0e-4f, "unlabeled used controller exposes its SFZ default");
+    require(metadata.namedControllers[1].number == 7
+            && metadata.namedControllers[1].label == "Volume"
+            && metadata.namedControllers[2].number == 10
+            && metadata.namedControllers[2].label == "Pan"
+            && metadata.namedControllers[3].number == 11
+            && metadata.namedControllers[3].label == "Expression",
+        "sfizz default modulation controllers remain assignable");
+    require(metadata.namedControllers[4].number == 20
+            && metadata.namedControllers[4].label == "Brightness",
+        "named controller number and label are preserved");
+    requireNear(metadata.namedControllers[4].defaultValue, 64.0f / 127.0f,
+        1.0e-4f, "SFZ controller default is exposed");
+    require(metadata.namedControllers[5].number == 23
+            && metadata.namedControllers[5].label == "CC 23",
+        "unknown unlabeled controller receives a numeric fallback name");
+    require(findNamedController(metadata, 74) == nullptr,
+        "dedicated timbre CC remains excluded even when used and labeled");
+    require(findNamedController(metadata, 120) == nullptr,
+        "destructive channel-mode CCs are excluded from CV assignment");
+    require(metadata.latchedKeyswitches.size() == 2,
+        "labeled and unlabeled latched keyswitches are detected");
+    require(metadata.latchedKeyswitches[0].note == 24
+            && metadata.latchedKeyswitches[0].label == "Legato",
+        "keyswitch SFZ label is preserved");
+    require(metadata.latchedKeyswitches[1].note == 25
+            && metadata.latchedKeyswitches[1].label.empty(),
+        "unlabeled keyswitch remains available for note-name display");
+}
+
 void testLaneTracking()
 {
     NoteLaneTracker tracker;
@@ -222,6 +333,8 @@ void testLaneTracking()
     tracker.process({ pitches, 3, &gate, 1, &velocity, 1, 0, 0 }, writer);
     require(writer.count == 6, "three gate rises emit note and pitch events");
     require(tracker.laneCount() == 3, "pitch channels define lane count");
+    require(tracker.activeCount() == 3,
+        "mono gate broadcast counts every held logical lane");
     for (size_t lane = 0; lane < 3; ++lane) {
         require(events[lane * 2].type == EngineEventType::NoteOn,
             "note precedes initial pitch");
@@ -245,6 +358,8 @@ void testLaneTracking()
     requireNear(events[2].value, 13.2f, 1.0e-4f,
         "held bend remains relative to gate-edge note across semitones");
     require(tracker.activeNote(0) == 60, "held base note never changes");
+    require(tracker.activeCount() == 1,
+        "channel shrink removes released lanes from held count");
 
     writer.count = 0;
     float jitteredPitch = movedPitch
@@ -265,6 +380,8 @@ void testLaneTracking()
     require(writer.count == 1 && events[0].type == EngineEventType::NoteOff
             && events[0].note == 60,
         "note-off uses gate-edge note after pitch travel");
+    require(tracker.activeCount() == 0,
+        "note-off clears held count independently of release tails");
 
     writer.count = 0;
     float silentPitch = -1.0f;
@@ -278,6 +395,7 @@ void testLaneTracking()
         "lane retriggers a newly decomposed note");
     requireNear(events[0].value, 0.8f, 1.0e-6f,
         "unpatched velocity defaults to 0.8");
+    require(tracker.activeCount() == 1, "retrigger restores held count");
 
     writer.count = 0;
     const float invalidGate = std::numeric_limits<float>::quiet_NaN();
@@ -452,10 +570,219 @@ double toneMagnitude(const std::vector<std::array<float, 2>>& audio,
     return 2.0 * std::hypot(real, imaginary) / frames;
 }
 
+double relativeRmsDifference(
+    const std::vector<std::array<float, 2>>& actual,
+    const std::vector<std::array<float, 2>>& reference)
+{
+    require(actual.size() == reference.size(), "audio comparison size");
+    double signal = 0.0;
+    double difference = 0.0;
+    for (size_t frame = 0; frame < actual.size(); ++frame) {
+        const double expected = reference[frame][0];
+        const double error = actual[frame][0] - expected;
+        signal += expected * expected;
+        difference += error * error;
+    }
+    return std::sqrt(difference / std::max(signal, 1.0e-30));
+}
+
+double audioRms(const std::vector<std::array<float, 2>>& audio)
+{
+    double sum = 0.0;
+    for (const auto& frame : audio)
+        sum += static_cast<double>(frame[0]) * frame[0];
+    return std::sqrt(sum / std::max<size_t>(audio.size(), 1));
+}
+
 void configure(SfiziosoEngine& engine)
 {
     engine.setSampleRate(SampleRate);
     engine.setMaximumBlockSize(64);
+}
+
+void testExpressionReleaseOwnership(const Fixtures& fixtures)
+{
+    const fs::path path = fixtures.directory / "expression-release.sfz";
+    struct Case {
+        const char* name;
+        const char* opcode;
+        std::function<TimedEngineEvent(float)> expression;
+    };
+    const std::array<Case, 3> cases {
+        Case { "named CC", "volume_oncc20=24",
+            [](float value) { return TimedEngineEvent::sourceCC(0, 0, 20, value); } },
+        Case { "timbre", "volume_oncc74=24",
+            [](float value) { return TimedEngineEvent::timbre(0, 0, value); } },
+        Case { "pressure", "volume_oncc129=24",
+            [](float value) { return TimedEngineEvent::pressure(0, 0, value); } },
+    };
+
+    for (const Case& test : cases) {
+        std::ofstream document(path);
+        document
+            << "<control> label_cc20=Color set_cc20=0\n"
+               "<region> sample=*sine lokey=60 hikey=81 pitch_keycenter=60 "
+               "ampeg_attack=0 ampeg_release=1 volume=-24 "
+            << test.opcode << "\n";
+        document.close();
+
+        SfiziosoEngine actual;
+        SfiziosoEngine reference;
+        for (SfiziosoEngine* engine : { &actual, &reference }) {
+            configure(*engine);
+            require(engine->load(path.string()).success,
+                "expression release fixture loads");
+            renderBlocks(*engine, 4096,
+                { test.expression(0.75f),
+                    TimedEngineEvent::noteOn(1, 0, 60, 0.8f),
+                    TimedEngineEvent::notePitch(1, 0, 60, 0.0f) });
+        }
+
+        TimedEngineEvent changedExpression = test.expression(0.0f);
+        changedExpression.frameOffset = 1;
+        const auto changed = renderBlocks(actual, 8192,
+            { TimedEngineEvent::noteOff(0, 0, 60), changedExpression,
+                TimedEngineEvent::noteOn(2, 0, 81, 0.8f),
+                TimedEngineEvent::notePitch(2, 0, 81, 0.0f) });
+        const auto unchanged = renderBlocks(reference, 8192,
+            { TimedEngineEvent::noteOff(0, 0, 60),
+                TimedEngineEvent::noteOn(2, 0, 81, 0.8f),
+                TimedEngineEvent::notePitch(2, 0, 81, 0.0f) });
+        constexpr size_t AnalysisOffset = 1024;
+        constexpr size_t AnalysisFrames = 4096;
+        const double oldTail = toneMagnitude(changed, AnalysisOffset,
+            AnalysisFrames, 261.625565);
+        const double oldTailReference = toneMagnitude(unchanged, AnalysisOffset,
+            AnalysisFrames, 261.625565);
+        const double tailDifference = std::abs(oldTail - oldTailReference)
+            / std::max(oldTailReference, 1.0e-30);
+        require(tailDifference < 0.005,
+            "lane reuse does not alter " + std::string(test.name)
+                + " on an old tail (RMS delta "
+                + std::to_string(tailDifference) + ")");
+        const double reusedNote = toneMagnitude(changed, AnalysisOffset,
+            AnalysisFrames, 880.0);
+        const double reusedNoteReference = toneMagnitude(unchanged,
+            AnalysisOffset, AnalysisFrames, 880.0);
+        require(reusedNote < reusedNoteReference * 0.35,
+            "reused lane applies new " + std::string(test.name)
+                + " only to its replacement note (actual "
+                + std::to_string(reusedNote) + ", reference "
+                + std::to_string(reusedNoteReference) + ")");
+    }
+}
+
+void testNativeChannelAftertouchIsolation(const Fixtures& fixtures)
+{
+    const fs::path path = fixtures.directory / "channel-aftertouch-lanes.sfz";
+    std::ofstream document(path);
+    document
+        << "<region> sample=*sine lokey=60 hikey=81 pitch_keycenter=60 "
+           "ampeg_attack=0 ampeg_release=0 cutoff=100 "
+           "cutoff_chanaft=9600 fil_type=lpf_2p volume=-12\n";
+    document.close();
+
+    const auto renderPressure = [&path](float first, float second) {
+        SfiziosoEngine engine;
+        configure(engine);
+        require(engine.load(path.string()).success,
+            "native channel-aftertouch fixture loads");
+        return renderBlocks(engine, 8192,
+            { TimedEngineEvent::pressure(0, 0, first),
+                TimedEngineEvent::pressure(0, 1, second),
+                TimedEngineEvent::noteOn(1, 0, 60, 0.8f),
+                TimedEngineEvent::notePitch(1, 0, 60, 0.0f),
+                TimedEngineEvent::noteOn(1, 1, 81, 0.8f),
+                TimedEngineEvent::notePitch(1, 1, 81, 0.0f) });
+    };
+
+    const auto split = renderPressure(0.0f, 1.0f);
+    const auto bothLow = renderPressure(0.0f, 0.0f);
+    const auto bothHigh = renderPressure(1.0f, 1.0f);
+    constexpr size_t AnalysisOffset = 1024;
+    constexpr size_t AnalysisFrames = 4096;
+    constexpr double FirstFrequency = 261.625565;
+    constexpr double SecondFrequency = 880.0;
+    const auto magnitude = [](const auto& audio, double frequency) {
+        return toneMagnitude(audio, AnalysisOffset, AnalysisFrames, frequency);
+    };
+    const double splitFirst = magnitude(split, FirstFrequency);
+    const double splitSecond = magnitude(split, SecondFrequency);
+    const double lowFirst = magnitude(bothLow, FirstFrequency);
+    const double lowSecond = magnitude(bothLow, SecondFrequency);
+    const double highFirst = magnitude(bothHigh, FirstFrequency);
+    const double highSecond = magnitude(bothHigh, SecondFrequency);
+
+    require(std::abs(splitFirst - lowFirst) < std::abs(splitFirst - highFirst)
+            && std::abs(splitSecond - highSecond)
+                < std::abs(splitSecond - lowSecond),
+        "native channel aftertouch follows each Rack lane independently");
+}
+
+void testAudibleArticulationChange(const Fixtures& fixtures)
+{
+    const fs::path path = fixtures.directory / "articulation.sfz";
+    std::ofstream document(path);
+    document
+        << "<global> key=60 pitch_keycenter=60 ampeg_attack=0 ampeg_release=0\n"
+           "<region> sample=*sine sw_last=24 sw_label=Sine\n"
+           "<region> sample=*saw sw_last=25\n";
+    document.close();
+
+    const auto renderSelection = [&path](uint8_t switchNote) {
+        SfiziosoEngine engine;
+        configure(engine);
+        require(engine.load(path.string()).success,
+            "articulation audio fixture loads");
+        return renderBlocks(engine, 8192,
+            { TimedEngineEvent::keyswitchOn(0, 0, switchNote),
+                TimedEngineEvent::keyswitchOff(1, 0, switchNote),
+                TimedEngineEvent::noteOn(2, 0, 60, 0.8f),
+                TimedEngineEvent::notePitch(2, 0, 60, 0.0f) });
+    };
+    const auto sine = renderSelection(24);
+    const auto saw = renderSelection(25);
+    require(relativeRmsDifference(saw, sine) > 0.25,
+        "changing the latched keyswitch audibly selects a different region");
+}
+
+void testPolyphonicArticulationIsolation(const Fixtures& fixtures)
+{
+    const fs::path path = fixtures.directory / "poly-articulation.sfz";
+    std::ofstream document(path);
+    document
+        << "<global> sample=*sine key=60 pitch_keycenter=60 "
+           "ampeg_attack=0 ampeg_release=0\n"
+           "<region> sw_last=24 volume=-24\n"
+           "<region> sw_last=25 volume=0\n";
+    document.close();
+
+    const auto renderNotes = [&path](bool twoLanes) {
+        SfiziosoEngine engine;
+        configure(engine);
+        require(engine.load(path.string()).success,
+            "polyphonic articulation fixture loads");
+        std::vector<TimedEngineEvent> events {
+            TimedEngineEvent::keyswitchOn(0, 0, twoLanes ? 24 : 25),
+            TimedEngineEvent::keyswitchOff(1, 0, twoLanes ? 24 : 25),
+        };
+        if (twoLanes) {
+            events.push_back(TimedEngineEvent::keyswitchOn(0, 1, 25));
+            events.push_back(TimedEngineEvent::keyswitchOff(1, 1, 25));
+        }
+        events.push_back(TimedEngineEvent::noteOn(2, 0, 60, 0.8f));
+        events.push_back(TimedEngineEvent::notePitch(2, 0, 60, 0.0f));
+        if (twoLanes) {
+            events.push_back(TimedEngineEvent::noteOn(2, 1, 60, 0.8f));
+            events.push_back(TimedEngineEvent::notePitch(2, 1, 60, 0.0f));
+        }
+        return renderBlocks(engine, 8192, events);
+    };
+
+    const double loudLane = audioRms(renderNotes(false));
+    const double mixedLanes = audioRms(renderNotes(true));
+    require(mixedLanes > loudLane * 0.9 && mixedLanes < loudLane * 1.4,
+        "simultaneous Rack lanes retain distinct sw_last articulations");
 }
 
 void testGeneratedFixtures(const Fixtures& fixtures)
@@ -728,6 +1055,7 @@ int main()
     const std::vector<std::pair<std::string, std::function<void()>>> unitTests {
         { "voltage conversion", testConversions },
         { "event ordering", testEventOrdering },
+        { "expression mapping and selector hysteresis", testExpressionUtilities },
         { "lane tracking, shrink, bend, release, retrigger", testLaneTracking },
         { "duplicate note lanes", testDuplicateNotes },
         { "bounded event failure", testBoundedEventFailure },
@@ -750,6 +1078,16 @@ int main()
         Fixtures fixtures;
         testGeneratedFixtures(fixtures);
         std::cout << "PASS: generated mono/stereo fixtures and stereo routing\n";
+        testInstrumentMetadata(fixtures);
+        std::cout << "PASS: named controls and latched keyswitch metadata\n";
+        testExpressionReleaseOwnership(fixtures);
+        std::cout << "PASS: expression release-tail ownership\n";
+        testNativeChannelAftertouchIsolation(fixtures);
+        std::cout << "PASS: native channel-aftertouch lane isolation\n";
+        testAudibleArticulationChange(fixtures);
+        std::cout << "PASS: audible latched articulation selection\n";
+        testPolyphonicArticulationIsolation(fixtures);
+        std::cout << "PASS: polyphonic latched articulation isolation\n";
         testEngineNoteIdentity(fixtures);
         std::cout << "PASS: engine duplicate/release-tail identity\n";
         testEngineTailPolicies(fixtures);

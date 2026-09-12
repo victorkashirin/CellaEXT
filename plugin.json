@@ -16,6 +16,16 @@
         "Sampler",
         "Polyphonic"
       ]
+    },
+    {
+      "slug": "CellaSFZExpression",
+      "name": "SFZ Expression",
+      "description": "Polyphonic expression and articulation expander for Cella SFZ",
+      "keywords": "sfz expression expander mpe keyswitch articulation",
+      "tags": [
+        "Expander",
+        "Polyphonic"
+      ]
     }
   ]
 }

@@ -8,13 +8,15 @@
 
 namespace cella::sfz {
 
-// Enough room for the worst case of a tail-control, note-on and initial pitch
-// event on every lane and frame at the largest selectable quantum. No
-// allocation occurs while processing.
+// Per lane, a frame can contribute bend + note-on + note-pitch + a generated
+// tail-policy choke. A block boundary can additionally contribute pressure,
+// timbre, two events for each named-control reassignment, and a keyswitch
+// note-on/off. This conservative bound keeps both Cella's capture array and
+// this post-tail-expansion queue lossless without allocating while processing.
 class BlockAdapter {
 public:
     static constexpr int MaxFrames = 64;
-    static constexpr size_t MaxEvents = 16 * 3 * MaxFrames;
+    static constexpr size_t MaxEvents = 16 * (4 * MaxFrames + 12);
 
     explicit BlockAdapter(SamplerEngine& engine) noexcept;
 
